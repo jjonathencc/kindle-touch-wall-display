@@ -1,0 +1,73 @@
+{
+ "items": [
+  {
+   "name": "TRMNL Calendar",
+   "priority": 1,
+   "items": [
+    {
+     "name": "Test once (keeps Kindle normal)",
+     "action": "/bin/sh",
+     "params": "bin/calendar.sh once",
+     "priority": 1,
+     "exitmenu": true,
+     "refresh": false,
+     "status": false
+    },
+    {
+     "name": "Suspend test (2 min, then wakes)",
+     "action": "/bin/sh",
+     "params": "bin/calendar.sh suspendtest",
+     "priority": 2,
+     "exitmenu": true,
+     "refresh": false,
+     "status": false
+    },
+    {
+     "name": "Suspend test WITH takeover (diagnostic)",
+     "action": "./bin/calendar.sh",
+     "params": "suspendtest-takeover",
+     "priority": 3,
+     "exitmenu": true,
+     "refresh": false,
+     "status": false
+    },
+    {
+     "name": "Start calendar display",
+     "action": "/bin/sh",
+     "params": "bin/calendar.sh start",
+     "priority": 4,
+     "exitmenu": true,
+     "refresh": false,
+     "status": false
+    },
+    {
+     "name": "Stop and restore Kindle",
+     "action": "/bin/sh",
+     "params": "bin/calendar.sh stop",
+     "priority": 5,
+     "exitmenu": true,
+     "refresh": false,
+     "status": false
+    },
+    {
+     "name": "Diagnose probes",
+     "action": "/bin/sh",
+     "params": "bin/calendar.sh probe",
+     "priority": 6,
+     "exitmenu": true,
+     "refresh": false,
+     "status": false
+    },
+    {
+     "name": "Show type ruler",
+     "action": "/bin/sh",
+     "params": "bin/calendar.sh ruler",
+     "priority": 7,
+     "exitmenu": true,
+     "refresh": false,
+     "status": false
+    }
+   ]
+  }
+ ]
+}
