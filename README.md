@@ -1,4 +1,4 @@
-# Kindle Wall Calendar
+# Kindle Wall Display
 
 Turn a jailbroken Kindle into a low-power wall display that runs for weeks
 on a charge instead of the few days you get from leaving a browser open.
@@ -22,7 +22,7 @@ this project.
 <table>
 <tr>
 <td width="50%"><img src="docs/images/holding-trmnl.jpg" alt="Holding the TRMNL terminal"></td>
-<td width="50%"><img src="docs/images/holding-kindle.jpg" alt="Holding the Kindle wall calendar"></td>
+<td width="50%"><img src="docs/images/holding-kindle.jpg" alt="Holding the Kindle wall display"></td>
 </tr>
 <tr>
 <td align="center">The TRMNL terminal, the inspiration</td>
