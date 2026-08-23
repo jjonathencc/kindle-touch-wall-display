@@ -1,15 +1,23 @@
 # Kindle Wall Calendar
 
-Turn a jailbroken Kindle into a wall calendar that runs for weeks on a
-charge instead of the few days you get from leaving a browser open. It
-suspends the whole device between refreshes and wakes on a hardware alarm,
-so e-ink holds the image for free while it sleeps.
+Turn a jailbroken Kindle into a low-power wall display that runs for weeks
+on a charge instead of the few days you get from leaving a browser open.
+It suspends the whole device between refreshes and wakes on a hardware
+alarm, so e-ink holds whatever image you last sent it for free while it
+sleeps.
+
+The client and the suspend/wake engine are what this repo actually is.
+What shows up on the screen is entirely up to your server: point it at
+any PNG and the Kindle draws it. It ships with a placeholder image so you
+have something to see on day one. See [The placeholder](#the-placeholder).
 
 This is mostly a manual. It ships a small piece of code too.
 
 I had a TRMNL terminal for a few years as an always-on display and loved
 it. When an old Kindle ended up sitting in a drawer, I gave it the same
-job for free.
+job for free. My own server renders a calendar, because that's what I
+wanted on my wall, but a calendar is just my use case, not the point of
+this project.
 
 <table>
 <tr>
@@ -22,8 +30,8 @@ job for free.
 </tr>
 </table>
 
-Here is what each screen actually shows, with sample events standing in for a
-real week so the layout is easy to read:
+Here is what my own server renders, as one example of what's possible. Sample
+events stand in for a real week so the layout is easy to read:
 
 <table>
 <tr>
@@ -44,8 +52,9 @@ real week so the layout is easy to read:
 2. **Install KUAL and MRPI** using
    [kindlemodding.org's guide](https://kindlemodding.org/jailbreaking/post-jailbreak/installing-kual-mrpi/).
 3. **Stand up a display server** on your LAN. Self-host
-   [byos_fastapi](https://github.com/usetrmnl/byos_fastapi) and write a
-   plugin that returns a calendar PNG. See [The server](#the-server).
+   [byos_fastapi](https://github.com/usetrmnl/byos_fastapi) and serve
+   [the placeholder](#the-placeholder) to start, or write a plugin that
+   returns your own PNG right away. See [The server](#the-server).
 4. **Copy `kindle/trmnlcal/` to `extensions/trmnlcal/`** on the Kindle over
    USB, and set the `SERVER` line in `bin/calendar.sh` to your server's
    address.
@@ -69,8 +78,9 @@ days of battery instead of weeks, but it can never fail to wake up.
   a plain USB copy, on purpose.
 - **A machine on your LAN** for the display server. A Raspberry Pi is
   plenty.
-- **A plugin that renders your calendar to a PNG.** You write this. See
-  [The server](#the-server).
+- **A plugin that renders whatever you want to a PNG.** You write this. The
+  repo ships a placeholder so you have something to serve on day one. See
+  [The placeholder](#the-placeholder) and [The server](#the-server).
 
 ## Jailbreak
 
@@ -134,11 +144,39 @@ earlier work. That code is not shipped here. Clone and self-host it
 yourself. [TRMNL](https://trmnl.com) is the company this API shape comes
 from, and they sell their own hardware if you would rather buy than build.
 
-**One gap:** the plugin that renders my calendar into a PNG lives in my
-server fork, not here. It is wired into personal infrastructure I would
-have to strip out first, so for now you get the client and the API
-contract above and you write the plugin. For a Paperwhite 5, target
-1236x1648 portrait, 8-bit grayscale.
+The plugin that renders my own calendar into a PNG lives in my server
+fork, not here. It is wired into personal infrastructure I would have to
+strip out first, so what you get here is the client, the API contract
+above, and a placeholder image to serve while you write your own plugin.
+
+## The placeholder
+
+[`assets/placeholder.png`](assets/placeholder.png) is what a fresh install
+shows: 1236x1648, 8-bit grayscale, sized for the Paperwhite 5 panel. It
+says so on the screen, on purpose, so there's no doubt about whether your
+setup is working or whether you're just looking at a stale render.
+
+To use it, point your server's `GET /api/display` response at this file
+until you have your own plugin. Once your Kindle is drawing it, everything
+in [Quick start](#quick-start) is confirmed working end to end: the
+jailbreak, KUAL, the network path to your server, and the suspend cycle.
+From there, replacing it is just a matter of pointing that same response
+at a different PNG. Your Kindle picks up the change on its next refresh
+cycle, no USB trip needed.
+
+What you serve after that is entirely yours to decide. A calendar is what
+I built, because it's what I wanted on my wall, but the client doesn't
+know or care what the image is. A few things that would work just as
+well:
+
+- A calendar
+- The weather
+- Family photos on rotation
+- Server or homelab stats
+- Departure times for the bus or train
+
+Anything that fits in a 1236x1648 grayscale PNG and that you're willing to
+regenerate every refresh cycle works.
 
 ## The extension
 
