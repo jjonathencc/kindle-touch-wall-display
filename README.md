@@ -7,8 +7,27 @@ so e-ink holds the image for free while it sleeps.
 
 This is mostly a manual. It ships a small piece of code too.
 
-**[Photo/GIF placeholder: add a picture of the calendar on the wall before
-publishing]**
+I had a TRMNL terminal for a few years as an always-on display and loved
+it. When an old Kindle ended up sitting in a drawer, I gave it the same
+job for free.
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/trmnl-display.jpg" alt="TRMNL terminal showing the weather"></td>
+<td width="50%"><img src="docs/images/kindle-display.jpg" alt="Kindle showing a calendar"></td>
+</tr>
+<tr>
+<td align="center">The TRMNL terminal, the inspiration</td>
+<td align="center">The Kindle, running the same idea for free</td>
+</tr>
+</table>
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/holding-trmnl.jpg" alt="Holding the TRMNL terminal"></td>
+<td width="50%"><img src="docs/images/holding-kindle.jpg" alt="Holding the Kindle wall calendar"></td>
+</tr>
+</table>
 
 ## Quick start
 
