@@ -13,12 +13,26 @@ job for free.
 
 <table>
 <tr>
-<td width="50%"><img src="docs/images/holding-trmnl.jpg" alt="TRMNL terminal showing the weather"></td>
-<td width="50%"><em>[Kindle calendar photo pending, see note below]</em></td>
+<td width="50%"><img src="docs/images/holding-trmnl.jpg" alt="Holding the TRMNL terminal"></td>
+<td width="50%"><img src="docs/images/holding-kindle.jpg" alt="Holding the Kindle wall calendar"></td>
 </tr>
 <tr>
 <td align="center">The TRMNL terminal, the inspiration</td>
 <td align="center">The Kindle, running the same idea for free</td>
+</tr>
+</table>
+
+Here is what each screen actually shows, with sample events standing in for a
+real week so the layout is easy to read:
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/weather-display.png" alt="TRMNL weather display"></td>
+<td width="50%"><img src="docs/images/calendar-display.png" alt="Kindle calendar display"></td>
+</tr>
+<tr>
+<td align="center">The TRMNL: weather, a quote, and server stats</td>
+<td align="center">The Kindle: a week of sample events</td>
 </tr>
 </table>
 
