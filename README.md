@@ -108,11 +108,10 @@ earlier work. That code is not shipped here. Clone and self-host it
 yourself. [TRMNL](https://trmnl.com) is the company this API shape comes
 from, and they sell their own hardware if you would rather buy than build.
 
-**One honest gap:** the plugin that renders my calendar into a PNG lives in
-my server fork, not here. It is wired into personal infrastructure that
-would need real work to sanitize, so rather than ship something
-half-scrubbed I am shipping the client and the API contract above. You will
-need to write a plugin that returns a PNG. For a Paperwhite 5, target
+**One gap:** the plugin that renders my calendar into a PNG lives in my
+server fork, not here. It is wired into personal infrastructure I would
+have to strip out first, so for now you get the client and the API
+contract above and you write the plugin. For a Paperwhite 5, target
 1236x1648 portrait, 8-bit grayscale.
 
 ## The extension
