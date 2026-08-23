@@ -13,19 +13,12 @@ job for free.
 
 <table>
 <tr>
-<td width="50%"><img src="docs/images/trmnl-display.jpg" alt="TRMNL terminal showing the weather"></td>
-<td width="50%"><img src="docs/images/kindle-display.jpg" alt="Kindle showing a calendar"></td>
+<td width="50%"><img src="docs/images/holding-trmnl.jpg" alt="TRMNL terminal showing the weather"></td>
+<td width="50%"><em>[Kindle calendar photo pending, see note below]</em></td>
 </tr>
 <tr>
 <td align="center">The TRMNL terminal, the inspiration</td>
 <td align="center">The Kindle, running the same idea for free</td>
-</tr>
-</table>
-
-<table>
-<tr>
-<td width="50%"><img src="docs/images/holding-trmnl.jpg" alt="Holding the TRMNL terminal"></td>
-<td width="50%"><img src="docs/images/holding-kindle.jpg" alt="Holding the Kindle wall calendar"></td>
 </tr>
 </table>
 
