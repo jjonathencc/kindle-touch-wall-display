@@ -5,24 +5,16 @@
 # alarm. E-ink holds the last image with no power, so the agenda stays visible while
 # the device sleeps. That is what buys months-class battery instead of days.
 #
-# The suspend cycle is PROVEN: this has run as the normal operating mode in
-# production since early August 2026, with nightly runs of roughly 96 wake
-# cycles (one every 15 minutes) confirming months-class battery, and a further
-# fix in August 2026 that closed a gap where a long Wi-Fi retry could outlive
-# its safety alarm (see the re-arm logic in the wifi-retry loop below). On a
-# device where the RTC wakealarm interface is present and writable, this is
-# no longer an open question - it works.
-#
-# It still is an open question on hardware this hasn't run on, so:
+# The suspend cycle is UNPROVEN on this device. The 2026-08-02 probe confirmed the
+# wakealarm interface exists and is writable from this script's context; it did not
+# prove suspend enters, the alarm fires, resume is clean, or Wi-Fi comes back. So:
 #
 #   1. "suspendtest" is the one-shot diagnostic: arm +120s, suspend once, report a
-#      PASS/FAIL card on the panel and a verdict line in calendar.log. Run this
-#      first on any device this hasn't been proven on yet.
+#      PASS/FAIL card on the panel and a verdict line in calendar.log.
 #   2. The refresh loop only attempts suspend when the file suspend.enabled exists
 #      next to this log. Nothing creates that file automatically - not even a
 #      passing suspendtest. It is placed by hand, over USB, after the diagnostic
-#      verdict has been read. Without it the loop refreshes fully awake - a safe
-#      default for a device this hasn't been proven on yet.
+#      verdict has been read. Without it the loop refreshes fully awake.
 #
 # Fail-safe rules the loop obeys, in order of importance:
 #   - Never suspend without reading the armed alarm back from the RTC.
@@ -44,17 +36,9 @@
 # never set on the device, so every default below is the real device value.
 #
 # Usage: calendar.sh once | suspendtest [seconds] | start | stop | probe | ruler
-#
-# ---- CONFIGURE THESE for your setup (edit below, or export as env vars) ----
-#   TRMNL_SERVER        base URL of your TRMNL-API-compatible server, e.g.
-#                        http://192.168.1.50:8484 (see README "Server" section)
-#   TRMNL_DEVICE_ID      the device ID you registered on that server
-#   TRMNL_ACCESS_TOKEN   the access token your server expects for this device
-# ------------------------------------------------------------------------
 
 SERVER="${TRMNL_SERVER:-http://CHANGE_ME_SERVER_HOST:8484}"
-DEVICE="${TRMNL_DEVICE_ID:-CHANGE_ME_DEVICE_ID}"
-ACCESS_TOKEN="${TRMNL_ACCESS_TOKEN:-CHANGE_ME_ACCESS_TOKEN}"
+DEVICE="kindle-01"
 BASE="${TRMNL_BASE:-/mnt/us/calendar}"
 OUT="$BASE/screen.png"
 TMP="$BASE/screen.png.part"
@@ -63,6 +47,12 @@ PIDFILE="$BASE/loop.pid"
 STATEFILE="$BASE/takeover.active"
 STOPFLAG="$BASE/stop.flag"
 SUSPEND_ENABLED="$BASE/suspend.enabled"
+STAY_AWAKE_FILE="$BASE/stay_awake_until"   # absolute epoch; command channel's stay-awake
+LAST_COMMAND_FILE="$BASE/last_command_id"  # id of the last command actually acted on
+PENDING_ACK_FILE="$BASE/pending_ack"       # id owed an ack on the next successful push_log
+PREV_SCRIPT_FILE="$BASE/calendar.sh.prev"      # last-known-good, saved before every swap
+UPDATE_PROBATION_FILE="$BASE/update_probation" # absolute deadline epoch; presence = "on probation"
+UPDATE_OK_FILE="$BASE/update_ok"               # presence = a post-update cycle actually completed
 FBINK="${TRMNL_FBINK:-/mnt/us/libkh/bin/fbink}"
 
 INTERVAL="${TRMNL_INTERVAL:-900}"    # fallback seconds between refreshes; the live
@@ -81,12 +71,15 @@ WIFI_RESET_TRIES="${TRMNL_WIFI_RESET_TRIES:-3}"  # hard radio resets before a cy
 FAIL_BACKOFF="${TRMNL_FAIL_BACKOFF:-60}"         # awake pause after a failed cycle
 REDRAW_EVERY="${TRMNL_REDRAW_EVERY:-30}"         # re-blit cadence during awake sleeps
 HEARTBEAT_EVERY="${TRMNL_HEARTBEAT_EVERY:-30}"  # log a liveness line this often while waiting
+AWAKE_WALL_BUDGET_MULT="${TRMNL_AWAKE_WALL_BUDGET_MULT:-2}"    # awake_sleep bails out once REAL
+AWAKE_WALL_BUDGET_GRACE="${TRMNL_AWAKE_WALL_BUDGET_GRACE:-120}" # elapsed time exceeds total*MULT+GRACE
 KILL_WINDOW="${TRMNL_KILL_WINDOW:-5}"            # pause before suspend so stop can win
 MAX_FAILS=3
 SUSPEND_RETRIES="${TRMNL_SUSPEND_RETRIES:-5}"   # transient display/wifi locks clear in seconds
 SUSPEND_RETRY_WAIT="${TRMNL_SUSPEND_RETRY_WAIT:-4}"
 
 RTC_ALARM="${TRMNL_RTC_ALARM:-/sys/class/rtc/rtc0/wakealarm}"
+RTC_ALARM_BACKUP="${TRMNL_RTC_ALARM_BACKUP:-/sys/class/rtc/rtc1/wakealarm}"
 POWER_STATE="${TRMNL_POWER_STATE:-/sys/power/state}"
 
 # ---------------------------------------------------------------- watchdog
@@ -97,7 +90,7 @@ POWER_STATE="${TRMNL_POWER_STATE:-/sys/power/state}"
 # process stopped existing. With the loop gone, nothing held the device awake,
 # powerd suspended it, and because the loop dies BEFORE it arms the next alarm
 # the device slept with no wake alarm at all. It stayed dark for four hours until
-# the power button brought it back.
+# Jonathan held the power button.
 #
 # Two independent guards, because either one alone leaves a hole:
 #   1. SAFETY ALARM, armed at the TOP of every cycle for interval+grace. If the
@@ -149,24 +142,46 @@ heartbeat() {
 }
 
 # Ship the tail of the log to the server. This exists so that diagnosing this
-# device NEVER requires another USB pass: every plug/unplug cycle costs real
-# time and gets old fast. Best effort only - it must never fail a cycle, never
-# block, and never be the reason a refresh dies.
-# Read it back on your server's logs by grepping for KINDLE_LOG, e.g. (if
-# self-hosting with Docker):
-#   docker logs <your-trmnl-server-container> 2>&1 | grep KINDLE_LOG
+# device NEVER requires another USB pass: every plug/unplug cycle costs Jonathan
+# real time and broke his patience on 2026-08-04, fairly. Best effort only - it
+# must never fail a cycle, never block, and never be the reason a refresh dies.
+# Read it back on the server with:
+#   docker logs trmnl-server 2>&1 | grep KINDLE_LOG
+#
+# Also carries the wifi update channel's check-in fields: version and script_md5
+# go out on every call so the server can confirm an update actually applied, and
+# ack_command_id (when ACK_ID is set by apply_pending_command) is how the device
+# tells the server it received and acted on a command. All flat top-level keys,
+# not nested, mirroring the cmd_* fields on /api/display - the device never needs
+# a JSON library, only sed/awk key:value extraction, in either direction.
+ACK_ID=""
 push_log() {   # $1 = short reason tag, $2 = how many trailing lines
     [ -n "$HTTP" ] || return 0
     tail_n="${2:-40}"
     body=$(tail -n "$tail_n" "$LOG" 2>/dev/null \
         | tr -d '\\"' | tr '\t' ' ' | awk '{printf "%s | ", $0}')
-    payload="{\"device\":\"$DEVICE\",\"tag\":\"KINDLE_LOG ${1:-tick}\",\"body\":\"$body\"}"
+    extra=""
+    [ -n "$SCRIPT_VERSION" ] && extra="$extra,\"version\":\"$SCRIPT_VERSION\""
+    [ -n "$SCRIPT_MD5" ] && extra="$extra,\"script_md5\":\"$SCRIPT_MD5\""
+    [ -n "$ACK_ID" ] && extra="$extra,\"ack_command_id\":\"$ACK_ID\""
+    payload="{\"device\":\"$DEVICE\",\"tag\":\"KINDLE_LOG ${1:-tick}\",\"body\":\"$body\"$extra}"
+    push_rc=1
     case "$HTTP" in
         curl) curl -s -m 15 -X POST -H "Content-Type: application/json" \
-                   -d "$payload" "$SERVER/api/log" >/dev/null 2>&1 ;;
+                   -d "$payload" "$SERVER/api/log" >/dev/null 2>&1
+              push_rc=$? ;;
         wget) wget -q -T 15 -O /dev/null --header="Content-Type: application/json" \
-                   --post-data="$payload" "$SERVER/api/log" >/dev/null 2>&1 ;;
+                   --post-data="$payload" "$SERVER/api/log" >/dev/null 2>&1
+              push_rc=$? ;;
     esac
+    # Only clear the owed ack once it has actually gone out. A failed POST leaves
+    # ACK_ID (and PENDING_ACK_FILE, which survives a restart) set so the very next
+    # push_log call - or the next loop process, after a restart - tries again.
+    if [ "$push_rc" -eq 0 ] && [ -n "$ACK_ID" ]; then
+        log "ack sent for command id=$ACK_ID"
+        ACK_ID=""
+        : > "$PENDING_ACK_FILE" 2>/dev/null
+    fi
     return 0
 }
 
@@ -323,6 +338,66 @@ wifi_up() {
     return 0
 }
 
+# ---- wifi outage diagnostics (2026-08-22, instrumentation only) ----
+#
+# 2026-08-22: a ~4h40m outage (05:21-10:02) was fully reconstructed from the
+# local log and showed wifi_reset()'s 3x-hard-reset-then-give-up sequence
+# taking 27-51 minutes per pass against a nominal ~3-4 min bound - but could
+# NOT tell whether that gap was (a) an uncontrolled suspend freezing the wait
+# mid-call (the 2026-08-13 mechanism), (b) the wifi driver genuinely wedged,
+# or (c) an AP-side problem. These two functions are pure logging - nothing
+# here changes retry counts, timing, or control flow - so the NEXT drop
+# records the deciding evidence instead of leaving the same open question.
+#
+# wall-clock (date +%s) advances through an uncontrolled suspend; monotonic
+# uptime (/proc/uptime, first field) does not on this kernel family. The gap
+# between the two IS the suspended duration - a large positive gap here
+# proves (a) directly, for that specific wait_for_wifi call.
+wifi_log_suspend_gap() {   # $1 = wall_start(date+%s) $2 = uptime_start(or empty) $3 = outcome tag
+    w1=$(date +%s)
+    wall_elapsed=$(( w1 - $1 ))
+    if [ -n "$2" ] && [ -r /proc/uptime ]; then
+        u1=$(awk '{print $1}' /proc/uptime 2>/dev/null)
+        u0i=$(awk -v v="$2" 'BEGIN{print int(v)}' 2>/dev/null)
+        u1i=$(awk -v v="$u1" 'BEGIN{print int(v)}' 2>/dev/null)
+        case "$u0i$u1i" in *[!0-9]*|"") log "WIFIDIAG wait_for_wifi[$3] wall=${wall_elapsed}s uptime=unreadable"; return ;; esac
+        uptime_elapsed=$(( u1i - u0i ))
+        gap=$(( wall_elapsed - uptime_elapsed ))
+        log "WIFIDIAG wait_for_wifi[$3] wall=${wall_elapsed}s uptime=${uptime_elapsed}s suspend_gap=${gap}s"
+    else
+        log "WIFIDIAG wait_for_wifi[$3] wall=${wall_elapsed}s uptime=unavailable"
+    fi
+}
+
+# Driver/link/AP state snapshot, logged whenever a hard-reset pass fails to
+# bring wifi back. Every probe is defensive (command -v / -r checked first)
+# and best-effort - an absent tool just means one less line, never a stall or
+# a failed cycle. Distinguishes driver-wedge (b) from AP-side (c): a genuinely
+# wedged driver tends to show stale/zeroed /proc/net/wireless and iwconfig
+# fields; an AP-side problem tends to show a live, scanning radio that simply
+# never completes an association.
+wifi_diag_snapshot() {   # $1 = short context tag
+    tag="${1:-wifi}"
+    if command -v dmesg >/dev/null 2>&1; then
+        dmesg_tail=$(dmesg 2>/dev/null | tail -n 15 | tr '\n' ';' | tr -d '"\\')
+        [ -n "$dmesg_tail" ] && log "WIFIDIAG $tag dmesg: $dmesg_tail"
+    fi
+    if [ -r /proc/net/wireless ]; then
+        wireless_line=$(awk 'NR > 2 && /:/ {print; exit}' /proc/net/wireless 2>/dev/null | tr -d '"\\')
+        [ -n "$wireless_line" ] && log "WIFIDIAG $tag /proc/net/wireless: $wireless_line"
+    fi
+    if command -v iwconfig >/dev/null 2>&1; then
+        iwc=$(iwconfig 2>/dev/null | tr '\n' ';' | tr -d '"\\')
+        [ -n "$iwc" ] && log "WIFIDIAG $tag iwconfig: $iwc"
+    fi
+    if command -v lipc-get-prop >/dev/null 2>&1; then
+        for prop in cmState signalStrength associated essid apMac; do
+            val=$(lipc-get-prop com.lab126.wifid "$prop" 2>/dev/null | tr -d '"\\')
+            [ -n "$val" ] && log "WIFIDIAG $tag wifid.$prop=$val"
+        done
+    fi
+}
+
 # A HARD radio cycle for when the driver comes back from suspend wedged and a plain
 # wifi_up is not enough. 2026-08-09: three cycles in a row logged wifi=FAIL after
 # wake, the radio never reassociated, and the loop gave up. wifi_up only asks the
@@ -349,14 +424,18 @@ wait_for_wifi() {   # $1 = optional max seconds (default WIFI_MAX_WAIT); echoes 
         return 0
     fi
     w0=$(date +%s)
+    u0=""
+    [ -r /proc/uptime ] && u0=$(awk '{print $1}' /proc/uptime 2>/dev/null)
     while :; do
         if ping -c 1 "$WIFI_TEST_IP" >/dev/null 2>&1; then
+            wifi_log_suspend_gap "$w0" "$u0" ok
             echo $(( $(date +%s) - w0 ))
             return 0
         fi
         [ $(( $(date +%s) - w0 )) -ge "$_wmax" ] && break
         sleep 1
     done
+    wifi_log_suspend_gap "$w0" "$u0" timeout
     echo $(( $(date +%s) - w0 ))
     return 1
 }
@@ -369,6 +448,15 @@ fetch_and_draw() {   # $1 = "full" to force a flashing refresh
         return 1
     fi
 
+    # Cleared on every call, not just set on a match, so a network failure this
+    # cycle cannot leave a stale command from a PREVIOUS successful fetch sitting
+    # around to be re-applied by main_loop's apply_pending_command.
+    CMD_ID=""
+    CMD_NAME=""
+    CMD_EXPIRES_EPOCH=""
+    CMD_URL=""
+    CMD_SHA256=""
+
     rssi=$(rssi_value)
     batt=$(battery_percent)
 
@@ -376,12 +464,12 @@ fetch_and_draw() {   # $1 = "full" to force a flashing refresh
     # the full-grayscale PNG rather than a 1-bit BMP. Calling /api/display is also what
     # keeps the device card thumbnail current on the server's Devices tab.
     if [ "$HTTP" = "curl" ]; then
-        set -- -s -m 30 -H "ID: $DEVICE" -H "Access-Token: $ACCESS_TOKEN" -H "FW-Version: 1.6.6"
+        set -- -s -m 30 -H "ID: $DEVICE" -H "Access-Token: kindle" -H "FW-Version: 1.6.6"
         [ -n "$rssi" ] && set -- "$@" -H "RSSI: $rssi"
         [ -n "$batt" ] && set -- "$@" -H "Battery-Percent: $batt"
         json=$(curl "$@" "$SERVER/api/display")
     else
-        set -- -q -T 30 -O - --header="ID: $DEVICE" --header="Access-Token: $ACCESS_TOKEN" \
+        set -- -q -T 30 -O - --header="ID: $DEVICE" --header="Access-Token: kindle" \
             --header="FW-Version: 1.6.6"
         [ -n "$rssi" ] && set -- "$@" --header="RSSI: $rssi"
         [ -n "$batt" ] && set -- "$@" --header="Battery-Percent: $batt"
@@ -410,6 +498,15 @@ fetch_and_draw() {   # $1 = "full" to force a flashing refresh
             ;;
     esac
 
+    # Wifi update channel: flat cmd_* fields, same style as image_url/refresh_rate
+    # above. Empty cmd_id means "no command pending". cmd_url can itself contain
+    # slashes, so it gets a '#' sed delimiter instead of '/'.
+    CMD_ID=$(echo "$json" | sed -n 's/.*"cmd_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    CMD_NAME=$(echo "$json" | sed -n 's/.*"cmd_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    CMD_EXPIRES_EPOCH=$(echo "$json" | sed -n 's/.*"cmd_expires_epoch"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p')
+    CMD_URL=$(echo "$json" | sed -n 's#.*"cmd_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*#\1#p')
+    CMD_SHA256=$(echo "$json" | sed -n 's/.*"cmd_sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+
     if ! http_file "$img" "$TMP"; then
         log "ERROR download failed, keeping previous screen"
         return 1
@@ -434,8 +531,52 @@ fetch_and_draw() {   # $1 = "full" to force a flashing refresh
 # and writable from this script's context, so the mxc and rtcwake fallbacks the
 # first draft carried are gone: dead code on this device, and a fallback that only
 # fires when the primary breaks is exactly the code path that never gets tested.
+#
+# BACKUP ALARM (2026-08-21): about 1 wake in 50, the rtc0 alarm did not fire and
+# the screen simply stopped updating - no error, nothing in the log, because
+# nothing ran to write one. A single wake source has no redundancy: if rtc0's
+# alarm is silently dropped by the kernel or the hardware once in a while, there
+# is nothing else to wake the device. rtc1, where present and writable, gets the
+# SAME armed value mirrored onto it every time rtc0 is armed, so a missed rtc0
+# fire still has a second alarm pending. This is best-effort only: it never
+# blocks, and a failure to write rtc1 never fails the primary arm or the cycle.
+RTC1_WRITABLE=no
 
-arm_alarm() {   # $1 = seconds from now; rc 0 only when the armed value reads back
+detect_backup_rtc() {
+    if [ -e "$RTC_ALARM_BACKUP" ] && [ -w "$RTC_ALARM_BACKUP" ]; then
+        RTC1_WRITABLE=yes
+    else
+        RTC1_WRITABLE=no
+    fi
+    rtc0_state=unwritable
+    [ -w "$RTC_ALARM" ] && rtc0_state=writable
+    rtc1_state=absent
+    if [ -e "$RTC_ALARM_BACKUP" ]; then
+        rtc1_state=unwritable
+        [ -w "$RTC_ALARM_BACKUP" ] && rtc1_state=writable
+    fi
+    log "startup rtc: rtc0=$RTC_ALARM($rtc0_state) rtc1=$RTC_ALARM_BACKUP($rtc1_state) backup_alarm=$RTC1_WRITABLE"
+}
+
+# Best-effort power/suspend diagnostics, logged once at startup so a missed wake
+# is explainable from calendar.log alone without another USB pass. Both paths are
+# kernel-version-dependent, so each is checked before being read - an absent path
+# is silently skipped rather than logged as an error.
+log_power_diagnostics() {
+    if [ -r /sys/power/wakeup_count ]; then
+        wc=$(cat /sys/power/wakeup_count 2>/dev/null)
+        log "startup wakeup_count=${wc:-unreadable}"
+    fi
+    if [ -d /sys/power/suspend_stats ]; then
+        for f in /sys/power/suspend_stats/*; do
+            [ -f "$f" ] || continue
+            v=$(cat "$f" 2>/dev/null)
+            log "startup suspend_stats/$(basename "$f")=${v:-unreadable}"
+        done
+    fi
+}
+
+arm_alarm() {   # $1 = seconds from now; rc 0 only when the PRIMARY armed value reads back
     echo 0 > "$RTC_ALARM" 2>/dev/null
     if ! echo "+$1" > "$RTC_ALARM" 2>/dev/null; then
         # Some kernels reject the relative form; fall back to an absolute epoch.
@@ -456,12 +597,35 @@ arm_alarm() {   # $1 = seconds from now; rc 0 only when the armed value reads ba
         log "ERROR alarm readback $ARMED_AT is not in the future (now $now_s); refusing to suspend"
         return 1
     fi
-    log "alarm armed readback=$ARMED_AT (+$((ARMED_AT - now_s))s)"
+
+    if [ "$RTC1_WRITABLE" = yes ]; then
+        echo 0 > "$RTC_ALARM_BACKUP" 2>/dev/null
+        if echo "$ARMED_AT" > "$RTC_ALARM_BACKUP" 2>/dev/null; then
+            backup_readback=$(cat "$RTC_ALARM_BACKUP" 2>/dev/null)
+            log "backup alarm (rtc1) mirrored readback=${backup_readback:-FAIL}"
+        else
+            log "WARN backup alarm (rtc1) write failed; continuing on rtc0 alone"
+        fi
+    fi
+
+    # Clock sanity check, logged right after every successful arm so a wake that
+    # never fires can be told apart from a wake that fired against a clock that
+    # had drifted or reset. rtc0's own since_epoch is compared against the system
+    # clock the alarm math above was computed from.
+    rtc_since_epoch=""
+    [ -r /sys/class/rtc/rtc0/since_epoch ] && rtc_since_epoch=$(cat /sys/class/rtc/rtc0/since_epoch 2>/dev/null)
+    clock_drift=""
+    case "$rtc_since_epoch" in
+        ''|*[!0-9]*) ;;
+        *) clock_drift=$((now_s - rtc_since_epoch)) ;;
+    esac
+    log "alarm armed readback=$ARMED_AT (+$((ARMED_AT - now_s))s) rtc0_since_epoch=${rtc_since_epoch:-unavailable} sys_epoch=$now_s drift=${clock_drift:-n/a}s"
     return 0
 }
 
 disarm_alarm() {
     echo 0 > "$RTC_ALARM" 2>/dev/null
+    [ "$RTC1_WRITABLE" = yes ] && echo 0 > "$RTC_ALARM_BACKUP" 2>/dev/null
 }
 
 do_suspend() {   # $1 = expected seconds; sets SLEPT; rc 0 when the write succeeded
@@ -494,9 +658,11 @@ probe_report() {
     caps=$(ls /sys/class/power_supply/ 2>/dev/null | tr '\n' ' ')
     rtc=NONE
     [ -w "$RTC_ALARM" ] && rtc=wakealarm
+    detect_backup_rtc
+    log_power_diagnostics
 
     log "PROBE iface=${iface:-none} rssi=${rssi:-FAIL} batt=${batt:-FAIL}"
-    log "PROBE gasgauge=$gg lipc=$lp power_supply='${caps:-none}' http=${HTTP:-NONE} rtc=$rtc"
+    log "PROBE gasgauge=$gg lipc=$lp power_supply='${caps:-none}' http=${HTTP:-NONE} rtc=$rtc rtc_backup=$RTC1_WRITABLE"
 
     if [ -x "$FBINK" ]; then
         "$FBINK" -c >/dev/null 2>&1
@@ -709,6 +875,54 @@ wakelock_report() {
     fi
 }
 
+# ---- suspend-does-not-hold diagnostics (2026-08-23, instrumentation only) ----
+#
+# 2026-08-23: a genuine "ERROR suspend did not hold" (slept 223s of 900s) was
+# the actual trigger of an outage that then cascaded through the awake-fallback
+# path. wakelock_report() above already answers "what's holding a wakelock",
+# but not "what woke it back up". This answers that second question: call it
+# BEFORE disarm_alarm() clears the RTC register, so the register's value is
+# still whatever it was at the moment of the early wake. $1 = wakeup_count
+# captured right before the suspend attempt, for a before/after delta.
+suspend_hold_diag_snapshot() {   # $1 = wakeup_count sampled before the suspend attempt (or empty)
+    tag="suspend-hold"
+    if [ -r "$RTC_ALARM" ]; then
+        rtc_val=$(cat "$RTC_ALARM" 2>/dev/null)
+        # A cleared/near-zero register is consistent with the alarm having
+        # actually fired; a register still holding a FUTURE value implicates
+        # something else as the wake source, since the alarm we armed never
+        # got there.
+        log "SUSPENDDIAG $tag rtc0_wakealarm_register=${rtc_val:-unreadable}"
+    fi
+    if [ -r /sys/power/wakeup_count ]; then
+        wc_after=$(cat /sys/power/wakeup_count 2>/dev/null)
+        if [ -n "$1" ] && [ -n "$wc_after" ]; then
+            case "$1$wc_after" in
+                *[!0-9]*) log "SUSPENDDIAG $tag wakeup_count=${wc_after} (before value unreadable, no delta)" ;;
+                *) log "SUSPENDDIAG $tag wakeup_count=${wc_after} delta=$(( wc_after - $1 ))" ;;
+            esac
+        else
+            log "SUSPENDDIAG $tag wakeup_count=${wc_after:-unreadable}"
+        fi
+    fi
+    if [ -d /sys/power/suspend_stats ]; then
+        for f in /sys/power/suspend_stats/*; do
+            [ -f "$f" ] || continue
+            v=$(cat "$f" 2>/dev/null)
+            log "SUSPENDDIAG $tag suspend_stats/$(basename "$f")=${v:-unreadable}"
+        done
+    fi
+    # USB/charger state - relevant per Jonathan: the device was unplugged when
+    # 2026-08-23's trigger fired and is plugged in now, so this is worth having
+    # on record for every future occurrence regardless of which way it points.
+    for psy in /sys/class/power_supply/*/online /sys/class/power_supply/*/status; do
+        [ -r "$psy" ] || continue
+        v=$(cat "$psy" 2>/dev/null)
+        log "SUSPENDDIAG $tag $psy=${v:-unreadable}"
+    done
+    wakelock_report
+}
+
 takeover_end() {
     # Restore in the reverse order. Nothing here is persistent, so a power-button
     # restart also returns the Kindle to normal even if this never runs.
@@ -739,6 +953,207 @@ takeover_end() {
     [ -f "$STATEFILE" ] && mv "$STATEFILE" "$STATEFILE.last" 2>/dev/null
 }
 
+# ---------------------------------------------------------------- commands
+
+# Detach a fresh loop from SCRIPT_PATH (which, after apply_script_update, may now
+# point at a swapped-in file), then kill this process's own group. Mirrors the
+# watchdog's own resurrection pattern exactly. The watchdog is a SEPARATE process
+# and is untouched by this - it keeps polling the heartbeat file and supervises
+# the new loop exactly as it did the old one; PIDFILE gets overwritten by the new
+# loop's own startup line.
+respawn_loop() {
+    oldpid=$(cat "$PIDFILE" 2>/dev/null)
+    if command -v setsid >/dev/null 2>&1; then
+        setsid /bin/sh "$SCRIPT_PATH" __loop </dev/null >/dev/null 2>&1 &
+    else
+        /bin/sh "$SCRIPT_PATH" __loop </dev/null >/dev/null 2>&1 &
+    fi
+    sleep 2
+    if [ -n "$oldpid" ]; then
+        kill -- "-$oldpid" 2>/dev/null || kill "$oldpid" 2>/dev/null
+    fi
+    exit 0
+}
+
+# Download, verify, and atomically swap in a new calendar.sh. CMD_URL/CMD_SHA256
+# come from the server on every /api/display poll (see fetch_and_draw), resolved
+# fresh from whatever is on the server's disk right now - never trusted blindly:
+# a checksum mismatch keeps the CURRENT script running and just logs the mismatch,
+# exactly as required. Only sha256, not md5, is trusted for this verification -
+# md5 is only ever used for the lighter-weight version confirmation in push_log.
+apply_script_update() {
+    if [ -z "$CMD_URL" ] || [ -z "$CMD_SHA256" ]; then
+        log "ERROR COMMAND fetch-and-replace-script missing url or sha256; ignoring"
+        push_log "command-update-missing-params" 10
+        return 1
+    fi
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        log "ERROR COMMAND fetch-and-replace-script: no sha256sum on this device; cannot verify, keeping current script"
+        push_log "command-update-no-sha256sum" 10
+        return 1
+    fi
+
+    new_path="$BASE/calendar.sh.new"
+    if ! http_file "$CMD_URL" "$new_path"; then
+        log "ERROR COMMAND fetch-and-replace-script: download failed from $CMD_URL"
+        push_log "command-update-download-failed" 10
+        return 1
+    fi
+    if [ ! -s "$new_path" ]; then
+        log "ERROR COMMAND fetch-and-replace-script: downloaded file is empty"
+        push_log "command-update-empty" 10
+        return 1
+    fi
+
+    got_sha=$(sha256sum "$new_path" 2>/dev/null | awk '{print $1}')
+    if [ "$got_sha" != "$CMD_SHA256" ]; then
+        log "COMMAND fetch-and-replace-script: checksum MISMATCH expected=$CMD_SHA256 got=${got_sha:-none}; keeping current script"
+        mv "$new_path" "$new_path.mismatch" 2>/dev/null
+        push_log "command-update-checksum-mismatch" 15
+        return 1
+    fi
+
+    # The checksum only proves the download matches what the server sent - it says
+    # nothing about whether what the server sent actually RUNS. This is the one USB
+    # deploy; every fix after it rides this same channel, so a syntax error Jonathan
+    # authors has to be caught here, not discovered as a dark screen days later.
+    if ! sh -n "$new_path" 2>>"$LOG"; then
+        log "COMMAND fetch-and-replace-script: SYNTAX CHECK FAILED on downloaded script; keeping current script"
+        mv "$new_path" "$new_path.syntax-bad" 2>/dev/null
+        push_log "command-update-syntax-bad" 20
+        return 1
+    fi
+
+    # Last-known-good, saved BEFORE the swap so check_update_probation always has
+    # something to fall back to. Best-effort: if this copy fails, skip probation
+    # entirely and swap without a safety net rather than silently pretend one exists.
+    if cp "$SCRIPT_PATH" "$PREV_SCRIPT_FILE" 2>/dev/null; then
+        # A stale update_ok from an EARLIER update must not let this new one skip
+        # probation before it has proven anything itself.
+        [ -f "$UPDATE_OK_FILE" ] && mv "$UPDATE_OK_FILE" "$UPDATE_OK_FILE.prev" 2>/dev/null
+        probation_window=$(( ${iv:-$INTERVAL} * 3 ))
+        echo $(( $(date +%s) + probation_window )) > "$UPDATE_PROBATION_FILE" 2>/dev/null
+        log "COMMAND fetch-and-replace-script: saved $PREV_SCRIPT_FILE, probation window ${probation_window}s"
+    else
+        log "WARN COMMAND fetch-and-replace-script: could not save $PREV_SCRIPT_FILE; proceeding WITHOUT auto-revert probation"
+    fi
+
+    chmod +x "$new_path" 2>/dev/null
+    # Same-filesystem mv is the atomic swap: there is never a window where
+    # SCRIPT_PATH is missing or half-written, so a crash mid-swap cannot leave
+    # the device without a runnable script.
+    if ! mv "$new_path" "$SCRIPT_PATH" 2>/dev/null; then
+        log "ERROR COMMAND fetch-and-replace-script: swap into $SCRIPT_PATH failed"
+        push_log "command-update-swap-failed" 10
+        return 1
+    fi
+
+    log "COMMAND fetch-and-replace-script: applied sha256=$got_sha, relaunching"
+    push_log "command-update-applied" 15
+    respawn_loop
+}
+
+# Called from TWO places, both required - neither alone closes the hole:
+#   1. Very early at process start, right after SCRIPT_PATH is resolved and before
+#      any entrypoint-specific work, on EVERY start/respawn/relaunch - including a
+#      run of a script that might itself be the broken one. Catches a script that
+#      crashes, hangs before its first heartbeat, or otherwise never gets far
+#      enough to run main_loop at all.
+#   2. Once per main_loop iteration, right after heartbeat(). heartbeat() is
+#      written unconditionally every iteration, so a script that RUNS and
+#      heartbeats but never completes a single healthy fetch+draw cycle would
+#      otherwise satisfy the watchdog forever - the process never dies, so the
+#      start-time-only call would never get a chance to re-fire, and probation
+#      would never actually be enforced. This closes that gap.
+#
+# $@ = the args to relaunch the reverted script with. The two callers differ:
+# the start-time call forwards "$@" (the script's own original invocation args,
+# e.g. "suspendtest 120"), continuing whatever was originally asked for. The
+# in-loop call has no such args of its own to forward - it always passes the
+# literal "__loop", because that's what it needs to become again either way.
+#
+# Kept intentionally tiny and dependency-free (no curl/wget, no plugin logic) so
+# a broken update can't take this guard down with it. If probation expired with
+# no health marker, the update is presumed bad and gets reverted with no human
+# intervention, from whichever caller notices first.
+check_update_probation() {
+    [ -f "$UPDATE_PROBATION_FILE" ] || return 0
+    deadline=$(cat "$UPDATE_PROBATION_FILE" 2>/dev/null)
+    case "$deadline" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    [ -f "$UPDATE_OK_FILE" ] && return 0
+    now_s=$(date +%s)
+    [ "$now_s" -ge "$deadline" ] 2>/dev/null || return 0
+
+    log "UPDATE PROBATION EXPIRED (deadline=$deadline now=$now_s) with no update_ok; reverting to $PREV_SCRIPT_FILE"
+    if [ -s "$PREV_SCRIPT_FILE" ] && cp "$PREV_SCRIPT_FILE" "$SCRIPT_PATH" 2>/dev/null; then
+        chmod +x "$SCRIPT_PATH" 2>/dev/null
+        mv "$UPDATE_PROBATION_FILE" "$UPDATE_PROBATION_FILE.reverted" 2>/dev/null
+        log "UPDATE REVERTED: $PREV_SCRIPT_FILE restored over $SCRIPT_PATH; relaunching reverted script ($*)"
+        push_log "update-auto-reverted" 30
+        exec /bin/sh "$SCRIPT_PATH" "$@"
+    fi
+    log "ERROR UPDATE PROBATION EXPIRED but $PREV_SCRIPT_FILE is missing/empty; cannot auto-revert, continuing on current script"
+    mv "$UPDATE_PROBATION_FILE" "$UPDATE_PROBATION_FILE.revert-failed" 2>/dev/null
+    push_log "update-auto-revert-failed" 30
+}
+
+# Called once per cycle after a successful /api/display fetch. CMD_ID empty means
+# no command is pending. LAST_COMMAND_FILE is written BEFORE acting - not after -
+# because fetch-and-replace-script and restart both respawn and kill this process,
+# and the new process reads the same file: without recording first, a respawn
+# mid-action would make the new process see the same command still pending and
+# act on it again, forever.
+apply_pending_command() {
+    [ -n "$CMD_ID" ] || return 0
+    last=$(cat "$LAST_COMMAND_FILE" 2>/dev/null)
+    [ "$CMD_ID" = "$last" ] && return 0
+
+    log "COMMAND received id=$CMD_ID name=$CMD_NAME"
+    echo "$CMD_ID" > "$LAST_COMMAND_FILE" 2>/dev/null
+    echo "$CMD_ID" > "$PENDING_ACK_FILE" 2>/dev/null
+    ACK_ID="$CMD_ID"
+
+    case "$CMD_NAME" in
+        stay-awake)
+            if [ -n "$CMD_EXPIRES_EPOCH" ] && [ "$CMD_EXPIRES_EPOCH" -gt 0 ] 2>/dev/null; then
+                echo "$CMD_EXPIRES_EPOCH" > "$STAY_AWAKE_FILE" 2>/dev/null
+                log "COMMAND stay-awake armed until epoch=$CMD_EXPIRES_EPOCH"
+            else
+                log "ERROR COMMAND stay-awake missing a valid expiry; ignoring"
+            fi
+            push_log "command-stay-awake" 15
+            ;;
+        fetch-and-replace-script)
+            apply_script_update
+            ;;
+        restart)
+            log "COMMAND restart: relaunching loop"
+            push_log "command-restart" 15
+            respawn_loop
+            ;;
+        upload-full-log)
+            log "COMMAND upload-full-log"
+            push_log "command-full-log" 1000
+            # main_loop's own end-of-cycle push_log would otherwise fire immediately
+            # after this one with zero delay. Observed on-device (2026-08-22, 2/2):
+            # when that happens, THIS push - the one actually carrying the requested
+            # large tail - is the one that silently vanishes; only the smaller
+            # trailing push arrives. Root mechanism unconfirmed (possibly the size of
+            # this specific pull, possibly the back-to-back timing - a same-size
+            # command, stay-awake, has NOT shown this failure). Suppressing the
+            # second call removes the race either way, and this push already
+            # contains everything the normal one would have shown.
+            SKIP_NORMAL_PUSH=1
+            ;;
+        *)
+            log "WARN unknown command name '$CMD_NAME'; nothing to do"
+            push_log "command-unknown" 10
+            ;;
+    esac
+}
+
 # ---------------------------------------------------------------- loop
 
 main_loop() {
@@ -763,6 +1178,22 @@ main_loop() {
 
         n=$((n + 1))
         heartbeat
+        # Reset every iteration - apply_pending_command (below, via
+        # upload-full-log) is the only thing that ever sets this, and it must
+        # never leak forward into a later cycle that had no command at all.
+        SKIP_NORMAL_PUSH=0
+
+        # Probation is also enforced from INSIDE the loop, not just at process
+        # start. heartbeat() above is written unconditionally every iteration, so
+        # an updated script that runs and heartbeats but never completes a single
+        # healthy fetch+draw cycle would otherwise keep the watchdog satisfied
+        # forever - it never restarts the process, so the start-time-only guard
+        # would never re-fire and probation would never actually get enforced.
+        # Checking here closes that hole: a no-op until the deadline and a no-op
+        # once update_ok exists, same as the start-time guard, and it reverts and
+        # relaunches straight into __loop (not "$@" - main_loop has no original
+        # invocation args of its own to forward) when the deadline has passed.
+        check_update_probation __loop
 
         # SAFETY ALARM, armed before any work in this cycle can wedge.
         #
@@ -799,6 +1230,7 @@ main_loop() {
         # hit, then the normal CONTROLLED suspend (arm_alarm + readback) runs. This is
         # never an open-ended awake loop; the awake-fallback pattern stays banned.
         if [ "$wifi_ok" -ne 0 ]; then
+            wifi_diag_snapshot "probe-failed"
             screensaver_hold
             wifi_try=1
             while [ "$wifi_ok" -ne 0 ] && [ "$wifi_try" -le "$WIFI_RESET_TRIES" ]; do
@@ -820,10 +1252,12 @@ main_loop() {
                 extra=$(wait_for_wifi)
                 wifi_ok=$?
                 wifi_s=$((wifi_s + extra))
+                [ "$wifi_ok" -ne 0 ] && wifi_diag_snapshot "retry${wifi_try}-failed"
                 wifi_try=$((wifi_try + 1))
             done
             screensaver_release
             log "wifi recovery done: radio $([ "$wifi_ok" -eq 0 ] && echo up || echo 'still down') after ${wifi_s}s held (bounded)"
+            [ "$wifi_ok" -ne 0 ] && wifi_diag_snapshot "gave-up"
         fi
 
         cycle_ok=1
@@ -847,9 +1281,21 @@ main_loop() {
                     iv="$INTERVAL"; iv_src=default
                 fi
                 log "CYCLE n=$n batt=${batt:-none} wifi=${wifi_s}s fetch=ok interval=${iv}(${iv_src})"
+                # First fully successful cycle (fetch ok + draw ok) since an update
+                # was applied clears probation. Guarded on UPDATE_PROBATION_FILE so
+                # this is a no-op on every ordinary cycle when nothing is pending.
+                if [ -f "$UPDATE_PROBATION_FILE" ] && [ ! -f "$UPDATE_OK_FILE" ]; then
+                    : > "$UPDATE_OK_FILE" 2>/dev/null
+                    mv "$UPDATE_PROBATION_FILE" "$UPDATE_PROBATION_FILE.cleared" 2>/dev/null
+                    log "update probation cleared: first successful cycle after update confirmed healthy"
+                    push_log "update-confirmed-healthy" 15
+                fi
             else
                 log "CYCLE n=$n batt=${batt:-none} wifi=${wifi_s}s fetch=FAIL"
             fi
+            # The /api/display call ran (whether or not the image draw itself
+            # succeeded), so CMD_ID reflects whatever the server had pending.
+            apply_pending_command
         fi
 
         if [ "$cycle_ok" -ne 0 ]; then
@@ -865,22 +1311,53 @@ main_loop() {
             fails=$((fails + 1))
             log "cycle failed ($fails); wifi/fetch down, keeping last image, retry after suspend"
             [ $(( fails % 4 )) -eq 0 ] && wakelock_report
-            push_log "cycle-failed" 20
+            # Suppressed when upload-full-log already sent this cycle's push (see
+            # apply_pending_command) - that push already carries everything this
+            # one would show, and firing both back-to-back is what made the
+            # command's own (larger) push vanish on 2026-08-22.
+            [ "$SKIP_NORMAL_PUSH" -eq 1 ] || push_log "cycle-failed" 20
         else
             fails=0
-            push_log "cycle-ok" 12
+            [ "$SKIP_NORMAL_PUSH" -eq 1 ] || push_log "cycle-ok" 12
         fi
 
         # Small awake window so the loop can be stopped before it suspends.
         sleep "$KILL_WINDOW"
 
+        # stay-awake command: self-expiring, checked fresh every cycle against a
+        # plain epoch comparison. Nothing ever has to clear STAY_AWAKE_FILE - once
+        # its value is in the past this block is simply skipped and normal
+        # suspend.enabled behavior resumes on its own, which is what keeps this
+        # from being able to strand the device awake and burn the battery.
+        stay_awake_until=$(cat "$STAY_AWAKE_FILE" 2>/dev/null)
+        case "$stay_awake_until" in
+            ''|*[!0-9]*) stay_awake_until=0 ;;
+        esac
+        now_s=$(date +%s)
+        if [ "$stay_awake_until" -gt "$now_s" ] 2>/dev/null; then
+            screensaver_hold
+            # Faster polling while a debug session is live: a command queued mid
+            # stay-awake window (restart, another fetch-and-replace-script, upload
+            # a log) lands within about a minute instead of waiting out the full
+            # interval. Outside stay-awake this branch never runs, so ordinary
+            # cycles are untouched.
+            stay_awake_poll="$iv"
+            [ "$stay_awake_poll" -gt 60 ] 2>/dev/null && stay_awake_poll=60
+            log "stay-awake active, $((stay_awake_until - now_s))s remaining; plain sleep ${stay_awake_poll}s (fast-poll), device awake"
+            awake_sleep "$stay_awake_poll"
+            continue
+        fi
+
         if [ ! -f "$SUSPEND_ENABLED" ]; then
             screensaver_hold
             log "suspend locked (no suspend.enabled); plain sleep ${iv}s, device awake"
+            push_log "fallback-suspend-locked" 10
             awake_sleep "$iv"
             continue
         fi
         if [ "$suspend_fails" -ge "$MAX_FAILS" ]; then
+            log "suspend abandoned this run ($suspend_fails/$MAX_FAILS failures); plain sleep ${iv}s, device awake"
+            push_log "fallback-suspend-abandoned" 10
             awake_sleep "$iv"
             continue
         fi
@@ -914,6 +1391,10 @@ main_loop() {
         # with us and wakes to find this marker exactly one sleep old, which is
         # why WD_STALE has to exceed a whole interval rather than a cycle time.
         heartbeat
+        # Sampled here, before the attempt, so a short-sleep event below can log
+        # a before/after delta - a jump proves a real wakeup-IRQ source fired.
+        wakeup_count_before=""
+        [ -r /sys/power/wakeup_count ] && wakeup_count_before=$(cat /sys/power/wakeup_count 2>/dev/null)
         susp_try=1
         while [ "$susp_try" -le "$SUSPEND_RETRIES" ]; do
             do_suspend "$iv" && break
@@ -939,11 +1420,18 @@ main_loop() {
             suspend_fails=0
             log "WAKE n=$n slept=${SLEPT}s of ${iv}s"
         else
+            # Diagnostics BEFORE disarm_alarm clears the RTC register, so its
+            # value still reflects whatever state it was actually in at the
+            # moment of the early wake (a fired alarm typically reads back
+            # near-zero; a register still holding a FUTURE value means the
+            # alarm we armed is not what woke this).
+            suspend_hold_diag_snapshot "$wakeup_count_before"
             disarm_alarm
             suspend_fails=$((suspend_fails + 1))
             remain=$(( iv - SLEPT ))
             [ "$remain" -lt 1 ] && remain=1
             log "ERROR suspend did not hold: slept ${SLEPT}s of ${iv}s ($suspend_fails/$MAX_FAILS); staying awake ${remain}s"
+            push_log "suspend-not-held" 25
             suspend_fallback_check
             awake_sleep "$remain"
         fi
@@ -977,6 +1465,22 @@ awake_sleep() {   # $1 = total seconds
     left=$1
     total=$1
     since_beat=0
+    # 2026-08-23: `left` only ever decrements by a fixed $chunk each iteration,
+    # regardless of how much REAL wall-clock time that particular `sleep $chunk`
+    # actually consumed. An uncontrolled suspend mid-chunk freezes the process;
+    # once resumed (by this call's OWN alarm net above, exactly as designed),
+    # `sleep` simply finishes its remaining monotonic seconds and `left` ticks
+    # down normally - so the chunk counter can look completely healthy while
+    # real time balloons far past $total. One such call absorbed ~1h44m of real
+    # time this way (fetch/check-in cadence at a dead stop the whole time)
+    # before this fix, against a requested wait of under 15 minutes. Bounding on
+    # REAL elapsed wall-clock, not just the chunk counter, is what forces control
+    # back to a full fetch+push+resuspend-retry cycle instead of silently
+    # absorbing hours - the alarm net still catches each individual uncontrolled
+    # suspend exactly as before; this only stops FURTHER chunks from starting
+    # once the real-world budget for this whole call is already spent.
+    wall_start=$(date +%s)
+    wall_budget=$(( $1 * AWAKE_WALL_BUDGET_MULT + AWAKE_WALL_BUDGET_GRACE ))
     while [ "$left" -gt 0 ]; do
         chunk="$REDRAW_EVERY"
         [ "$left" -lt "$chunk" ] && chunk="$left"
@@ -996,6 +1500,12 @@ awake_sleep() {   # $1 = total seconds
         fi
         if [ "$left" -gt 0 ] && [ -s "$OUT" ]; then
             draw "$OUT" >/dev/null 2>&1
+        fi
+        wall_elapsed=$(( $(date +%s) - wall_start ))
+        if [ "$wall_elapsed" -ge "$wall_budget" ]; then
+            log "WARN awake_sleep real wall-clock elapsed ${wall_elapsed}s vs requested ${total}s (budget ${wall_budget}s) - one or more uncontrolled suspends likely interrupted this wait; returning early to force a fetch+check-in+resuspend-retry cycle instead of continuing to absorb real time silently"
+            push_log "fallback-wall-budget-exceeded" 15
+            return 0
         fi
     done
     return 0
@@ -1020,6 +1530,22 @@ if [ -z "$SCRIPT_PATH" ] || [ ! -f "$SCRIPT_PATH" ]; then
         /*) SCRIPT_PATH="$0" ;;
         *)  SCRIPT_PATH="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")" ;;
     esac
+fi
+
+# Self-healing update check. Runs before ANYTHING entrypoint-specific, on every
+# single invocation (start, __loop, __watchdog relaunch, once, probe, ...), so a
+# script that is itself broken still hits this first. If it decides to revert, it
+# execs the reverted file and never returns here.
+check_update_probation "$@"
+
+# Reported on every push_log call so the server can confirm a fetch-and-replace-script
+# update actually applied: bump SCRIPT_VERSION by hand on future edits, and the md5
+# is read fresh off disk here so it always reflects whatever is CURRENTLY running,
+# including a script that was just swapped in by apply_script_update.
+SCRIPT_VERSION="${TRMNL_SCRIPT_VERSION:-2026-08-23.1}"
+SCRIPT_MD5=""
+if [ -n "$SCRIPT_PATH" ] && [ -r "$SCRIPT_PATH" ] && command -v md5sum >/dev/null 2>&1; then
+    SCRIPT_MD5=$(md5sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')
 fi
 
 case "$1" in
@@ -1108,6 +1634,17 @@ case "$1" in
         # the pid in the file is always the process stop must kill, never a wrapper.
         trap '' HUP
         echo $$ > "$PIDFILE"
+        detect_backup_rtc
+        log_power_diagnostics
+        log "startup version=${SCRIPT_VERSION:-unknown} script_md5=${SCRIPT_MD5:-unknown}"
+        # A respawn (from apply_script_update or the restart command) can leave an
+        # ack still owed to the server - the OLD process may have died before its
+        # push_log call went out. Pick it back up here so the ack is not lost.
+        pending_ack=$(cat "$PENDING_ACK_FILE" 2>/dev/null)
+        if [ -n "$pending_ack" ]; then
+            ACK_ID="$pending_ack"
+            log "resuming owed ack for command id=$ACK_ID after restart"
+        fi
         # The takeover MUST happen here, inside the detached child, never in the
         # parent. takeover_begin stops the framework, and the framework is what
         # runs KUAL, which is the parent of the launching script. On 2026-08-03 the
@@ -1174,6 +1711,13 @@ case "$1" in
         # over restarts.
         heartbeat
         pkill -f "calendar.sh __watchdog" >/dev/null 2>&1
+        # Mirrors the PIDFILE handling above. Without this, a WDPIDFILE left over
+        # from BEFORE a reboot already exists on disk, so the readiness-wait loop
+        # below (which only checks "does the file exist") passes immediately and
+        # reads that STALE pid instead of waiting for the new watchdog to write
+        # its own - confirmed on-device 2026-08-22 (announced pid 10359, the
+        # watchdog's own self-announcement said 7505).
+        mv "$WDPIDFILE" "$WDPIDFILE.prev" 2>/dev/null
         if command -v setsid >/dev/null 2>&1; then
             setsid /bin/sh "$SCRIPT_PATH" __watchdog </dev/null >/dev/null 2>&1 &
         else
