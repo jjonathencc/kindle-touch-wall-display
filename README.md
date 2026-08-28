@@ -68,6 +68,8 @@ events stand in for a real week so the layout is easy to read:
 Step 7 is deliberate. Without that file the loop refreshes fully awake:
 days of battery instead of weeks, but it can never fail to wake up.
 
+If a step does not work, see [Troubleshooting](#troubleshooting).
+
 ## What you need
 
 - **A jailbroken Kindle.** Proven on a Paperwhite 5 Signature Edition,
@@ -239,6 +241,118 @@ On top of the base suspend/wake pattern from kindle-dash, this adds:
 The goal is months of battery, unattended. Staying awake for reliability is
 a last resort the code falls back to after repeated suspend failures, not a
 fix.
+
+## Troubleshooting
+
+Start with the log. Everything the client does is written to
+`calendar/calendar.log` on the Kindle's USB drive, which is
+`/mnt/us/calendar/calendar.log` on the device. The watchdog keeps a second,
+smaller log beside it at `calendar/watchdog.log`. Neither file exists until you
+run a menu action once, because the script creates that folder on first run.
+
+You usually don't need USB to read it. Every cycle POSTs the tail of the same log
+to your server's `POST /api/log`. If you run byos_fastapi in Docker:
+
+```sh
+docker logs trmnl-server 2>&1 | grep KINDLE_LOG
+```
+
+Then run **KUAL > TRMNL Calendar > Diagnose probes**. It draws a card on the panel
+and writes the same as a `PROBE` line to the log: Wi-Fi interface, signal, battery
+source, HTTP client, and RTC alarm path. Most first-install problems are visible
+on that one card.
+
+Two habits that save time:
+
+- **Eject and unplug before using KUAL.** Files you copy over USB, including
+  `suspend.enabled` and `stop.flag`, are only visible to the device once it is
+  disconnected.
+- **A power-button restart always undoes everything.** The screen takeover is not
+  persistent, so restarting the Kindle hands it back to the reader even if the
+  script never got to clean up.
+
+### KUAL shows no TRMNL Calendar menu
+
+The extension has to sit at `extensions/trmnlcal/` with `config.xml` and
+`menu.json` directly inside it. Unzipping often produces a nested
+`trmnlcal/trmnlcal/`, which KUAL ignores. Confirm
+`extensions/trmnlcal/bin/calendar.sh` exists, then leave and re-enter KUAL, since
+it reads the menu when it launches.
+
+### Test once draws nothing
+
+The first thing to check is the `SERVER` line in `bin/calendar.sh`. Left at
+`CHANGE_ME_SERVER_HOST` it fails on every fetch. After that, match the last lines
+of `calendar.log` against this table.
+
+| Log line | What it means |
+| --- | --- |
+| `ERROR no image_url in response` | The `GET /api/display` call returned, but the JSON has no `image_url` field. Fix the server plugin, or point it at [the placeholder](#the-placeholder). |
+| `ERROR download failed, keeping previous screen` | The `image_url` itself was unreachable from the device. It is often a hostname the Kindle can't resolve, or a URL only valid on the server. |
+| `ERROR empty download, keeping previous screen` | The image URL answered with zero bytes. |
+| `ERROR no working display tool (fbink or eips)` | FBInk was not at `/mnt/us/libkh/bin/fbink` and `eips` was not on the path either. Nothing can draw until one of them is present. |
+| `ERROR no curl or wget on this device, cannot fetch` | No HTTP client. Diagnose probes shows this as `http client: NONE`. |
+
+An empty log after **Test once** means the script never ran at all. Recheck the
+install path above.
+
+### The image is stale, but the device is otherwise alive
+
+Every refresh writes one `CYCLE` line. A healthy one reads:
+
+```
+CYCLE n=12 batt=71 wifi=4s fetch=ok interval=900(served)
+```
+
+- `wifi=FAIL(63s) fetch=skipped` — the radio did not rejoin the access point.
+  This is [known issue (A)](#known-issues). The loop keeps the last image, keeps
+  suspending, and retries on each wake. Battery is unaffected and it has always
+  recovered on its own.
+- `fetch=FAIL` — the network came back but the fetch or the download failed. Use
+  the table above for the specific `ERROR` line just before it.
+- `interval=900(default)` instead of `(served)` — your server's `refresh_rate`
+  was missing or outside the accepted 300 to 21600 seconds, so the built-in
+  fallback was used.
+
+### Battery drains in days instead of weeks
+
+The loop only suspends when a file named `suspend.enabled` exists in the
+`calendar/` folder. Nothing creates it for you, not even a passing suspend test.
+The startup line says which mode you got:
+
+```
+loop started pid 8123 fallback_interval 900s suspend=enabled
+```
+
+`suspend=locked` means the file was not found. If it says `enabled` and the drain
+is still fast, look for these:
+
+- `ERROR RTC alarm did not arm or read back` — the script refuses to suspend
+  unless it can read the alarm back from the RTC.
+- `ERROR suspend write refused` — the kernel rejected the sleep.
+- `ERROR suspend did not hold: slept 223s of 900s` — it woke early. This is
+  [known issue (B)](#known-issues).
+
+Three of those in a row and the loop logs `suspend abandoned this run` and stays
+awake deliberately for the rest of that run. The display keeps working; battery
+becomes days-class. Stop and start the loop to try suspending again.
+
+### The loop won't stop
+
+Use **Stop and restore Kindle**. It kills the watchdog first, then the loop, then
+disarms the alarm and restarts the reader framework. Killing the loop any other
+way does not stop it: the watchdog treats a dead loop as the fault it was built
+for. It checks the heartbeat file every two minutes and relaunches the loop once
+that file is more than 40 minutes old.
+
+With no way into KUAL, create an empty file named `stop.flag` in the `calendar/`
+folder over USB. The loop finds it on its next wake, renames it `stop.flag.done`,
+restores the reader, and exits. The watchdog sees the same flag and exits without
+restarting anything. On a suspending device this takes up to one refresh interval.
+
+The watchdog never restarts anything silently. Every restart it performs appears
+in the main log as a `WATCHDOG` line and is pushed to the server with everything
+else.
 
 ## Known issues
 
