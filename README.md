@@ -43,8 +43,7 @@ extensions/
    about two minutes, it should wake and show a result screen. `PASS` means the
    Kindle suspended, woke on time, and reconnected to Wi-Fi.
 8. Press the Home button after reading the result. Test text may remain over the
-   home screen after a partial e-ink refresh. If it does, open KUAL and select
-   `Restore reader screen`. This does not indicate screen damage.
+   home screen after a partial e-ink refresh.
 9. After a passing test, connect the Kindle by USB and create an empty file named
    `wall-display/suspend.enabled`.
 10. Eject the Kindle and select `Start wall display` in KUAL.
