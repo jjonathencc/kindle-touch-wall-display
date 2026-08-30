@@ -1,16 +1,16 @@
 #!/bin/sh
-# TRMNL calendar screen for Kindle, run as a KUAL extension.
+# Wall display for the Kindle Touch, run as a KUAL extension.
 #
 # The battery plan: suspend the device to RAM between refreshes and wake on an RTC
 # alarm. E-ink holds the last image with no power, so the agenda stays visible while
 # the device sleeps. That is what buys months-class battery instead of days.
 #
-# The suspend cycle is UNPROVEN on this device. The 2026-08-02 probe confirmed the
-# wakealarm interface exists and is writable from this script's context; it did not
-# prove suspend enters, the alarm fires, resume is clean, or Wi-Fi comes back. So:
+# Test the suspend cycle on the target Kindle before using it unattended.
+# Firmware 5.3.7.3 uses the legacy i.MX wakeup_enable interface; merely
+# finding that file does not prove suspend, alarm wake, or Wi-Fi recovery. So:
 #
 #   1. "suspendtest" is the one-shot diagnostic: arm +120s, suspend once, report a
-#      PASS/FAIL card on the panel and a verdict line in calendar.log.
+#      PASS/FAIL card on the panel and a verdict line in wall-display.log.
 #   2. The refresh loop only attempts suspend when the file suspend.enabled exists
 #      next to this log. Nothing creates that file automatically - not even a
 #      passing suspendtest. It is placed by hand, over USB, after the diagnostic
@@ -35,14 +35,14 @@
 # The TRMNL_* environment overrides exist for the host-side test harness; they are
 # never set on the device, so every default below is the real device value.
 #
-# Usage: calendar.sh once | suspendtest [seconds] | start | stop | probe | ruler
+# Usage: wall-display.sh once | suspendtest [seconds] | start | stop | probe
 
 SERVER="${TRMNL_SERVER:-http://CHANGE_ME_SERVER_HOST:8484}"
 DEVICE="kindle-01"
-BASE="${TRMNL_BASE:-/mnt/us/calendar}"
+BASE="${TRMNL_BASE:-/mnt/us/wall-display}"
 OUT="$BASE/screen.png"
 TMP="$BASE/screen.png.part"
-LOG="$BASE/calendar.log"
+LOG="$BASE/wall-display.log"
 PIDFILE="$BASE/loop.pid"
 STATEFILE="$BASE/takeover.active"
 STOPFLAG="$BASE/stop.flag"
@@ -50,10 +50,33 @@ SUSPEND_ENABLED="$BASE/suspend.enabled"
 STAY_AWAKE_FILE="$BASE/stay_awake_until"   # absolute epoch; command channel's stay-awake
 LAST_COMMAND_FILE="$BASE/last_command_id"  # id of the last command actually acted on
 PENDING_ACK_FILE="$BASE/pending_ack"       # id owed an ack on the next successful push_log
-PREV_SCRIPT_FILE="$BASE/calendar.sh.prev"      # last-known-good, saved before every swap
+PREV_SCRIPT_FILE="$BASE/wall-display.sh.prev"  # last-known-good, saved before every swap
 UPDATE_PROBATION_FILE="$BASE/update_probation" # absolute deadline epoch; presence = "on probation"
 UPDATE_OK_FILE="$BASE/update_ok"               # presence = a post-update cycle actually completed
-FBINK="${TRMNL_FBINK:-/mnt/us/libkh/bin/fbink}"
+# FBInk is optional: the Kindle's built-in eips can display the PNG. Probe the
+# common NiLuJe package locations when FBInk is installed instead of assuming the
+# newer /mnt/us/libkh layout.
+if [ -n "${TRMNL_FBINK+set}" ]; then
+    FBINK="$TRMNL_FBINK"
+elif [ -x /mnt/us/extensions/FBInk/bin/fbink ]; then
+    FBINK=/mnt/us/extensions/FBInk/bin/fbink
+elif [ -x /mnt/us/libkh/bin/fbink ]; then
+    FBINK=/mnt/us/libkh/bin/fbink
+elif command -v fbink >/dev/null 2>&1; then
+    FBINK=$(command -v fbink)
+else
+    FBINK=""
+fi
+
+if [ -n "${TRMNL_EIPS+set}" ]; then
+    EIPS="$TRMNL_EIPS"
+elif [ -x /usr/sbin/eips ]; then
+    EIPS=/usr/sbin/eips
+elif command -v eips >/dev/null 2>&1; then
+    EIPS=$(command -v eips)
+else
+    EIPS=""
+fi
 
 INTERVAL="${TRMNL_INTERVAL:-900}"    # fallback seconds between refreshes; the live
                                      # value comes from the server's refresh_rate
@@ -78,9 +101,46 @@ MAX_FAILS=3
 SUSPEND_RETRIES="${TRMNL_SUSPEND_RETRIES:-5}"   # transient display/wifi locks clear in seconds
 SUSPEND_RETRY_WAIT="${TRMNL_SUSPEND_RETRY_WAIT:-4}"
 
-RTC_ALARM="${TRMNL_RTC_ALARM:-/sys/class/rtc/rtc0/wakealarm}"
+# Firmware 5.3.7.3 on the Kindle Touch uses the old Freescale i.MX RTC
+# wakeup_enable interface.  Newer Kindles use the standard wakealarm sysfs API.
+# They have different write/read semantics, so select a backend once and keep the
+# distinction explicit throughout the suspend safety checks.
+RTC_WAKEALARM_DEFAULT=/sys/class/rtc/rtc0/wakealarm
+RTC_MXC_DEFAULT=/sys/devices/platform/mxc_rtc.0/wakeup_enable
+RTC_ALARM="${TRMNL_RTC_ALARM:-}"
+RTC_MODE="${TRMNL_RTC_MODE:-auto}"
 RTC_ALARM_BACKUP="${TRMNL_RTC_ALARM_BACKUP:-/sys/class/rtc/rtc1/wakealarm}"
 POWER_STATE="${TRMNL_POWER_STATE:-/sys/power/state}"
+
+select_rtc_backend() {
+    if [ -n "$RTC_ALARM" ]; then
+        if [ "$RTC_MODE" = auto ]; then
+            case "$RTC_ALARM" in
+                */wakeup_enable) RTC_MODE=mxc ;;
+                *)               RTC_MODE=wakealarm ;;
+            esac
+        fi
+        return
+    fi
+
+    case "$RTC_MODE" in
+        mxc)       RTC_ALARM="$RTC_MXC_DEFAULT" ;;
+        wakealarm) RTC_ALARM="$RTC_WAKEALARM_DEFAULT" ;;
+        *)
+            # Prefer the Kindle Touch i.MX interface when it exists. On this kernel
+            # rtcN/wakealarm may exist but does not reliably wake the device.
+            if [ -e "$RTC_MXC_DEFAULT" ]; then
+                RTC_MODE=mxc
+                RTC_ALARM="$RTC_MXC_DEFAULT"
+            else
+                RTC_MODE=wakealarm
+                RTC_ALARM="$RTC_WAKEALARM_DEFAULT"
+            fi
+            ;;
+    esac
+}
+
+select_rtc_backend
 
 # ---------------------------------------------------------------- watchdog
 #
@@ -89,8 +149,8 @@ POWER_STATE="${TRMNL_POWER_STATE:-/sys/power/state}"
 # after that, not even one of the ERROR paths, so the script did not fail - the
 # process stopped existing. With the loop gone, nothing held the device awake,
 # powerd suspended it, and because the loop dies BEFORE it arms the next alarm
-# the device slept with no wake alarm at all. It stayed dark for four hours until
-# Jonathan held the power button.
+# the device slept with no wake alarm at all. It stayed dark until the power
+# button was held.
 #
 # Two independent guards, because either one alone leaves a hole:
 #   1. SAFETY ALARM, armed at the TOP of every cycle for interval+grace. If the
@@ -126,7 +186,7 @@ log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"
 }
 
-# The watchdog keeps its own file so a wedged/huge calendar.log can never stop it
+# The watchdog keeps its own file so a wedged/huge wall-display.log cannot stop it
 # writing, but it ALSO writes into the main log, because push_log only ships the
 # main log and a watchdog that restarts things invisibly is worse than no
 # watchdog. Every decision it makes ends up on the server.
@@ -141,10 +201,9 @@ heartbeat() {
     date +%s > "$HBFILE" 2>/dev/null
 }
 
-# Ship the tail of the log to the server. This exists so that diagnosing this
-# device NEVER requires another USB pass: every plug/unplug cycle costs Jonathan
-# real time and broke his patience on 2026-08-04, fairly. Best effort only - it
-# must never fail a cycle, never block, and never be the reason a refresh dies.
+# Ship the tail of the log to the server so routine diagnosis does not require a
+# USB connection. Best effort only: it must never fail a cycle, block, or cause a
+# refresh to fail.
 # Read it back on the server with:
 #   docker logs trmnl-server 2>&1 | grep KINDLE_LOG
 #
@@ -246,6 +305,13 @@ battery_percent() {
         _valid_percent "$b" && return
     fi
 
+    # Kindle Touch/PW1 (i.MX508, older 5.x firmware).
+    k5_batt=/sys/devices/system/yoshi_battery/yoshi_battery0/battery_capacity
+    if [ -r "$k5_batt" ]; then
+        b=$(cat "$k5_batt" 2>/dev/null | tr -cd '0-9')
+        _valid_percent "$b" && return
+    fi
+
     if command -v lipc-get-prop >/dev/null 2>&1; then
         b=$(lipc-get-prop com.lab126.powerd battLevel 2>/dev/null | tr -cd '0-9')
         _valid_percent "$b" && return
@@ -276,9 +342,14 @@ draw() {    # $1 = image path, $2 = "full" to flash the panel
             "$FBINK" -g file="$1" >/dev/null 2>&1 && return 0
         fi
     fi
-    if command -v eips >/dev/null 2>&1; then
-        [ "$2" = "full" ] && eips -c
-        eips -g "$1" >/dev/null 2>&1 && return 0
+    if [ -n "$EIPS" ] && [ -x "$EIPS" ]; then
+        # eips is native on the Kindle Touch. -f requests a full-quality refresh;
+        # separate clear it does not leave a visible white flash between calls.
+        if [ "$2" = "full" ]; then
+            "$EIPS" -f -g "$1" >/dev/null 2>&1 && return 0
+        else
+            "$EIPS" -g "$1" >/dev/null 2>&1 && return 0
+        fi
     fi
     log "ERROR no working display tool (fbink or eips)"
     return 1
@@ -287,16 +358,32 @@ draw() {    # $1 = image path, $2 = "full" to flash the panel
 # Text card drawn over whatever is on screen. Best effort: the framework can paint
 # over it later, so the log line is always the authoritative record.
 text_card() {   # $1 = headline, $2.. = detail lines
-    [ -x "$FBINK" ] || return 0
-    "$FBINK" -c >/dev/null 2>&1
-    "$FBINK" -y 3 "$1" >/dev/null 2>&1
-    y=5
-    shift
-    for line in "$@"; do
-        "$FBINK" -y "$y" "$line" >/dev/null 2>&1
-        y=$((y + 1))
-    done
-    "$FBINK" -y $((y + 2)) "Details: calendar/calendar.log" >/dev/null 2>&1
+    if [ -x "$FBINK" ]; then
+        "$FBINK" -c >/dev/null 2>&1
+        "$FBINK" -y 3 "$1" >/dev/null 2>&1
+        y=5
+        shift
+        for line in "$@"; do
+            "$FBINK" -y "$y" "$line" >/dev/null 2>&1
+            y=$((y + 1))
+        done
+        "$FBINK" -y $((y + 2)) "Details: wall-display/wall-display.log" >/dev/null 2>&1
+        return 0
+    fi
+
+    # The Kindle needs no extra package for diagnostic cards. eips can print text using
+    # character-cell coordinates. Keep lines short for its 600px-wide panel.
+    if [ -n "$EIPS" ] && [ -x "$EIPS" ]; then
+        "$EIPS" -c >/dev/null 2>&1
+        "$EIPS" 2 3 "$1" >/dev/null 2>&1
+        y=5
+        shift
+        for line in "$@"; do
+            "$EIPS" 2 "$y" "$line" >/dev/null 2>&1
+            y=$((y + 1))
+        done
+        "$EIPS" 2 $((y + 2)) "Details: wall-display/wall-display.log" >/dev/null 2>&1
+    fi
 }
 
 # ---------------------------------------------------------------- wifi
@@ -314,6 +401,10 @@ wifi_down() {
             log "wifi disabled before suspend (releases the WLAN timeout wakelock)"
             return 0
         }
+        lipc-set-prop com.lab126.wifid enable 0 >/dev/null 2>&1 && {
+            log "wifi disabled via legacy wifid LIPC property"
+            return 0
+        }
     fi
     if command -v wifid >/dev/null 2>&1; then
         wifid disable >/dev/null 2>&1 && { log "wifi disabled via wifid"; return 0; }
@@ -329,6 +420,7 @@ wifi_down() {
 wifi_up() {
     if command -v lipc-set-prop >/dev/null 2>&1; then
         lipc-set-prop com.lab126.cmd wirelessEnable 1 >/dev/null 2>&1 && return 0
+        lipc-set-prop com.lab126.wifid enable 1 >/dev/null 2>&1 && return 0
     fi
     if command -v wifid >/dev/null 2>&1; then
         wifid enable >/dev/null 2>&1 && return 0
@@ -527,10 +619,9 @@ fetch_and_draw() {   # $1 = "full" to force a flashing refresh
 
 # ---------------------------------------------------------------- rtc suspend
 
-# The 2026-08-02 on-device probe confirmed /sys/class/rtc/rtc0/wakealarm is present
-# and writable from this script's context, so the mxc and rtcwake fallbacks the
-# first draft carried are gone: dead code on this device, and a fallback that only
-# fires when the primary breaks is exactly the code path that never gets tested.
+# The Kindle Touch uses /sys/devices/platform/mxc_rtc.0/wakeup_enable and
+# expects a relative duration in seconds. Newer models use rtc0/wakealarm and
+# expose an absolute epoch on readback. select_rtc_backend chose one above.
 #
 # BACKUP ALARM (2026-08-21): about 1 wake in 50, the rtc0 alarm did not fire and
 # the screen simply stopped updating - no error, nothing in the log, because
@@ -543,7 +634,7 @@ fetch_and_draw() {   # $1 = "full" to force a flashing refresh
 RTC1_WRITABLE=no
 
 detect_backup_rtc() {
-    if [ -e "$RTC_ALARM_BACKUP" ] && [ -w "$RTC_ALARM_BACKUP" ]; then
+    if [ "$RTC_MODE" = wakealarm ] && [ -e "$RTC_ALARM_BACKUP" ] && [ -w "$RTC_ALARM_BACKUP" ]; then
         RTC1_WRITABLE=yes
     else
         RTC1_WRITABLE=no
@@ -555,11 +646,11 @@ detect_backup_rtc() {
         rtc1_state=unwritable
         [ -w "$RTC_ALARM_BACKUP" ] && rtc1_state=writable
     fi
-    log "startup rtc: rtc0=$RTC_ALARM($rtc0_state) rtc1=$RTC_ALARM_BACKUP($rtc1_state) backup_alarm=$RTC1_WRITABLE"
+    log "startup rtc: mode=$RTC_MODE primary=$RTC_ALARM($rtc0_state) rtc1=$RTC_ALARM_BACKUP($rtc1_state) backup_alarm=$RTC1_WRITABLE"
 }
 
 # Best-effort power/suspend diagnostics, logged once at startup so a missed wake
-# is explainable from calendar.log alone without another USB pass. Both paths are
+# is explainable from wall-display.log alone without another USB pass. Both paths are
 # kernel-version-dependent, so each is checked before being read - an absent path
 # is silently skipped rather than logged as an error.
 log_power_diagnostics() {
@@ -577,6 +668,28 @@ log_power_diagnostics() {
 }
 
 arm_alarm() {   # $1 = seconds from now; rc 0 only when the PRIMARY armed value reads back
+    case "$1" in
+        ''|*[!0-9]*|0) log "ERROR invalid alarm duration '$1'"; return 1 ;;
+    esac
+
+    if [ "$RTC_MODE" = mxc ]; then
+        # i.MX508 driver used by the Kindle Touch. It accepts a relative duration, not
+        # "+seconds" or an epoch. Clear first so repeated safety-alarm arms work.
+        printf '%s' 0 > "$RTC_ALARM" 2>/dev/null || return 1
+        printf '%s' "$1" > "$RTC_ALARM" 2>/dev/null || return 1
+        alarm_readback=$(cat "$RTC_ALARM" 2>/dev/null)
+        case "$alarm_readback" in
+            ''|*[!0-9]*|0)
+                log "ERROR mxc alarm readback invalid: '${alarm_readback:-empty}'"
+                return 1
+                ;;
+        esac
+        now_s=$(date +%s)
+        ARMED_AT=$((now_s + $1))
+        log "alarm armed mode=mxc readback=$alarm_readback duration=${1}s expected_epoch=$ARMED_AT"
+        return 0
+    fi
+
     echo 0 > "$RTC_ALARM" 2>/dev/null
     if ! echo "+$1" > "$RTC_ALARM" 2>/dev/null; then
         # Some kernels reject the relative form; fall back to an absolute epoch.
@@ -624,7 +737,11 @@ arm_alarm() {   # $1 = seconds from now; rc 0 only when the PRIMARY armed value 
 }
 
 disarm_alarm() {
-    echo 0 > "$RTC_ALARM" 2>/dev/null
+    if [ "$RTC_MODE" = mxc ]; then
+        printf '%s' 0 > "$RTC_ALARM" 2>/dev/null
+    else
+        echo 0 > "$RTC_ALARM" 2>/dev/null
+    fi
     [ "$RTC1_WRITABLE" = yes ] && echo 0 > "$RTC_ALARM_BACKUP" 2>/dev/null
 }
 
@@ -657,16 +774,19 @@ probe_report() {
     lp=$(command -v lipc-get-prop >/dev/null 2>&1 && echo yes || echo no)
     caps=$(ls /sys/class/power_supply/ 2>/dev/null | tr '\n' ' ')
     rtc=NONE
-    [ -w "$RTC_ALARM" ] && rtc=wakealarm
+    [ -w "$RTC_ALARM" ] && rtc="$RTC_MODE:$RTC_ALARM"
     detect_backup_rtc
     log_power_diagnostics
 
     log "PROBE iface=${iface:-none} rssi=${rssi:-FAIL} batt=${batt:-FAIL}"
-    log "PROBE gasgauge=$gg lipc=$lp power_supply='${caps:-none}' http=${HTTP:-NONE} rtc=$rtc rtc_backup=$RTC1_WRITABLE"
+    display=NONE
+    [ -x "$FBINK" ] && display="fbink:$FBINK"
+    [ "$display" = NONE ] && [ -n "$EIPS" ] && [ -x "$EIPS" ] && display="eips:$EIPS"
+    log "PROBE gasgauge=$gg lipc=$lp power_supply='${caps:-none}' http=${HTTP:-NONE} display=$display rtc=$rtc rtc_backup=$RTC1_WRITABLE"
 
     if [ -x "$FBINK" ]; then
         "$FBINK" -c >/dev/null 2>&1
-        "$FBINK" -y 2  "TRMNL calendar probe report" >/dev/null 2>&1
+        "$FBINK" -y 2  "Wall display diagnosis" >/dev/null 2>&1
         "$FBINK" -y 4  "wifi iface : ${iface:-none}" >/dev/null 2>&1
         "$FBINK" -y 5  "rssi       : ${rssi:-FAILED}" >/dev/null 2>&1
         "$FBINK" -y 6  "battery %  : ${batt:-FAILED}" >/dev/null 2>&1
@@ -674,8 +794,16 @@ probe_report() {
         "$FBINK" -y 9  "lipc       : $lp" >/dev/null 2>&1
         "$FBINK" -y 10 "power_supply: ${caps:-none}" >/dev/null 2>&1
         "$FBINK" -y 12 "http client: ${HTTP:-NONE}" >/dev/null 2>&1
-        "$FBINK" -y 13 "rtc wakeup : $rtc" >/dev/null 2>&1
-        "$FBINK" -y 15 "Also written to calendar.log" >/dev/null 2>&1
+        "$FBINK" -y 13 "display    : $display" >/dev/null 2>&1
+        "$FBINK" -y 14 "rtc wakeup : $rtc" >/dev/null 2>&1
+        "$FBINK" -y 15 "Also written to wall-display.log" >/dev/null 2>&1
+    elif [ -n "$EIPS" ] && [ -x "$EIPS" ]; then
+        text_card "Wall display diagnosis" \
+            "wifi: ${iface:-none} rssi=${rssi:-FAIL}" \
+            "battery: ${batt:-FAIL}%" \
+            "http: ${HTTP:-NONE}" \
+            "display: $display" \
+            "rtc: $RTC_MODE"
     fi
 }
 
@@ -728,9 +856,11 @@ suspend_test() {   # $1 = seconds to sleep, default 120
 
     if ! arm_alarm "$dur"; then
         log "SUSPENDTEST verdict=FAIL reason=alarm-not-armed (write failed or readback empty)"
-        text_card "TRMNL SUSPEND TEST: FAIL" \
+        text_card "SUSPEND TEST: FAIL" \
             "RTC alarm did not arm." \
-            "Device was NOT suspended and is awake."
+            "Device was not suspended and is awake." \
+            "Press Home after reading this." \
+            "Ghosting: run Restore reader screen."
         return 1
     fi
     log "SUSPENDTEST armed readback=$ARMED_AT now=$(date +%s); suspending"
@@ -740,9 +870,11 @@ suspend_test() {   # $1 = seconds to sleep, default 120
         log "SUSPENDTEST verdict=FAIL reason=suspend-write-refused"
         wakelock_report
         push_log "suspendtest-fail" 30
-        text_card "TRMNL SUSPEND TEST: FAIL" \
+        text_card "SUSPEND TEST: FAIL" \
             "Kernel refused the suspend write." \
-            "Device never slept and is awake."
+            "Device never slept and is awake." \
+            "Press Home after reading this." \
+            "Ghosting: run Restore reader screen."
         return 1
     fi
 
@@ -774,18 +906,22 @@ suspend_test() {   # $1 = seconds to sleep, default 120
         log "SUSPENDTEST note: suspend stays LOCKED for the loop until suspend.enabled is created by hand"
     fi
 
-    text_card "TRMNL SUSPEND TEST: $verdict" \
+    text_card "SUSPEND TEST: $verdict" \
         "slept      : ${SLEPT}s of ${dur}s" \
         "wifi back  : ${wifi_s}s (ok=$wifi_ok)" \
         "battery    : ${b0:-?}% -> ${b1:-?}%" \
-        "Device is awake and back to normal."
+        "The Kindle is awake." \
+        "Press Home after reading this." \
+        "Ghosting: run Restore reader screen."
     # The framework may repaint on resume; draw the card a second time so it wins.
     sleep 2
-    text_card "TRMNL SUSPEND TEST: $verdict" \
+    text_card "SUSPEND TEST: $verdict" \
         "slept      : ${SLEPT}s of ${dur}s" \
         "wifi back  : ${wifi_s}s (ok=$wifi_ok)" \
         "battery    : ${b0:-?}% -> ${b1:-?}%" \
-        "Device is awake and back to normal."
+        "The Kindle is awake." \
+        "Press Home after reading this." \
+        "Ghosting: run Restore reader screen."
     [ "$verdict" = "PASS" ]
 }
 
@@ -795,20 +931,18 @@ takeover_begin() {
     # Order follows kindle-dash: stop the reader UI first so nothing repaints over
     # the agenda, then drop the CPU to powersave.
     #
-    # preventScreenSaver is deliberately NOT set here. On the 2026-08-02 overnight
-    # run every suspend write came back refused, while the suspendtest - which never
-    # runs this takeover - suspended cleanly. preventScreenSaver's entire job is to
-    # hold the device awake, so setting it and then asking for suspend-to-RAM is
-    # asking powerd to fight the kernel. It is now set only when the loop gives up
-    # on suspend and needs to stay awake for long stretches (screensaver_hold).
+    # preventScreenSaver is deliberately NOT set here: its job is to hold the
+    # device awake, which conflicts with a controlled suspend. It is used only
+    # when the loop falls back to an awake wait (screensaver_hold).
     log "taking over screen"
-    # Firmware 5.19.2 evidence (2026-08-03 log): the old /etc/init.d/framework and
-    # bare initctl guards both failed SILENTLY, the framework stayed up, and the
-    # home UI repainted over the calendar - which read as "Start does nothing".
-    # So: try each known GUI stop in order, record which one actually worked, and
-    # say NONE out loud when nothing did. takeover_end restores the same method.
+    # Firmware 5.3.7.3 exposes /etc/init.d/framework, while newer releases moved
+    # GUI jobs behind Upstart. Prefer this method when the mxc RTC marks
+    # this as an older platform, then retain the newer fallbacks.
     gui_method=""
-    if command -v initctl >/dev/null 2>&1; then
+    if [ "$RTC_MODE" = mxc ] && [ -x /etc/init.d/framework ]; then
+        /etc/init.d/framework stop >/dev/null 2>&1 && gui_method="init.d framework"
+    fi
+    if [ -z "$gui_method" ] && command -v initctl >/dev/null 2>&1; then
         initctl stop framework >/dev/null 2>&1 && gui_method="initctl framework"
         if [ -z "$gui_method" ]; then
             initctl stop lab126_gui >/dev/null 2>&1 && gui_method="initctl lab126_gui"
@@ -912,9 +1046,7 @@ suspend_hold_diag_snapshot() {   # $1 = wakeup_count sampled before the suspend 
             log "SUSPENDDIAG $tag suspend_stats/$(basename "$f")=${v:-unreadable}"
         done
     fi
-    # USB/charger state - relevant per Jonathan: the device was unplugged when
-    # 2026-08-23's trigger fired and is plugged in now, so this is worth having
-    # on record for every future occurrence regardless of which way it points.
+    # Record the USB and charger state when diagnosing an unexpected wake.
     for psy in /sys/class/power_supply/*/online /sys/class/power_supply/*/status; do
         [ -r "$psy" ] || continue
         v=$(cat "$psy" 2>/dev/null)
@@ -953,6 +1085,30 @@ takeover_end() {
     [ -f "$STATEFILE" ] && mv "$STATEFILE" "$STATEFILE.last" 2>/dev/null
 }
 
+# Clear direct eips/FBInk output, then restart the reader so it repaints the
+# home screen. Run this in a detached process because stopping the framework
+# also stops KUAL and its foreground child.
+restore_reader_screen() {
+    restore_path=$(readlink -f "$0" 2>/dev/null)
+    if [ -z "$restore_path" ] || [ ! -f "$restore_path" ]; then
+        case "$0" in
+            /*) restore_path="$0" ;;
+            *)  restore_path="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")" ;;
+        esac
+    fi
+    if [ ! -f "$restore_path" ]; then
+        log "ERROR cannot resolve script path for reader restore"
+        return 1
+    fi
+
+    log "reader screen restore scheduled"
+    if command -v setsid >/dev/null 2>&1; then
+        setsid /bin/sh "$restore_path" __restore_reader </dev/null >/dev/null 2>&1 &
+    else
+        /bin/sh "$restore_path" __restore_reader </dev/null >/dev/null 2>&1 &
+    fi
+}
+
 # ---------------------------------------------------------------- commands
 
 # Detach a fresh loop from SCRIPT_PATH (which, after apply_script_update, may now
@@ -975,7 +1131,7 @@ respawn_loop() {
     exit 0
 }
 
-# Download, verify, and atomically swap in a new calendar.sh. CMD_URL/CMD_SHA256
+# Download, verify, and atomically swap in a new wall-display.sh. CMD_URL/CMD_SHA256
 # come from the server on every /api/display poll (see fetch_and_draw), resolved
 # fresh from whatever is on the server's disk right now - never trusted blindly:
 # a checksum mismatch keeps the CURRENT script running and just logs the mismatch,
@@ -993,7 +1149,7 @@ apply_script_update() {
         return 1
     fi
 
-    new_path="$BASE/calendar.sh.new"
+    new_path="$BASE/wall-display.sh.new"
     if ! http_file "$CMD_URL" "$new_path"; then
         log "ERROR COMMAND fetch-and-replace-script: download failed from $CMD_URL"
         push_log "command-update-download-failed" 10
@@ -1013,10 +1169,8 @@ apply_script_update() {
         return 1
     fi
 
-    # The checksum only proves the download matches what the server sent - it says
-    # nothing about whether what the server sent actually RUNS. This is the one USB
-    # deploy; every fix after it rides this same channel, so a syntax error Jonathan
-    # authors has to be caught here, not discovered as a dark screen days later.
+    # The checksum only proves that the download matches what the server sent. A
+    # syntax check is still needed before replacing the running script.
     if ! sh -n "$new_path" 2>>"$LOG"; then
         log "COMMAND fetch-and-replace-script: SYNTAX CHECK FAILED on downloaded script; keeping current script"
         mv "$new_path" "$new_path.syntax-bad" 2>/dev/null
@@ -1439,8 +1593,8 @@ main_loop() {
 }
 
 # Awake sleep with a redraw guard. When suspend is not running, the framework may
-# still be alive (5.19.2 has no verified GUI stop yet) and repaints over the agenda
-# whenever the device is touched. Sleeping in slices and re-blitting the last good
+# repaint over the agenda whenever the device is touched. Sleeping in slices and
+# re-blitting the last good
 # image caps any cover-up at REDRAW_EVERY seconds. It also notices stop.flag in a
 # slice instead of an interval. The suspend path never comes through here: a
 # suspended device holds its image with no power and needs no guard.
@@ -1519,7 +1673,7 @@ suspend_fallback_check() {
 
 # ---------------------------------------------------------------- entrypoints
 
-# Resolved once, for every branch. $0 is relative ("./bin/calendar.sh") when KUAL
+# Resolved once, for every branch. $0 is relative ("./bin/wall-display.sh") when KUAL
 # invokes us, and a detached child cannot rely on inheriting a working directory
 # that survives its parent - a relative path here is a way to launch nothing at
 # all. The watchdog relaunches the loop by this path, so it has to be correct in
@@ -1542,7 +1696,7 @@ check_update_probation "$@"
 # update actually applied: bump SCRIPT_VERSION by hand on future edits, and the md5
 # is read fresh off disk here so it always reflects whatever is CURRENTLY running,
 # including a script that was just swapped in by apply_script_update.
-SCRIPT_VERSION="${TRMNL_SCRIPT_VERSION:-2026-08-23.1}"
+SCRIPT_VERSION="${TRMNL_SCRIPT_VERSION:-2026-08-30-touch.2}"
 SCRIPT_MD5=""
 if [ -n "$SCRIPT_PATH" ] && [ -r "$SCRIPT_PATH" ] && command -v md5sum >/dev/null 2>&1; then
     SCRIPT_MD5=$(md5sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')
@@ -1569,6 +1723,22 @@ case "$1" in
         ;;
     suspendtest)
         suspend_test "$2"
+        ;;
+    restore)
+        restore_reader_screen
+        ;;
+    __restore_reader)
+        trap '' HUP TERM
+        sleep 2
+        takeover_begin
+        sleep 1
+        if [ -x "$FBINK" ]; then
+            "$FBINK" -c -f >/dev/null 2>&1 || "$FBINK" -c >/dev/null 2>&1
+        elif [ -n "$EIPS" ] && [ -x "$EIPS" ]; then
+            "$EIPS" -c >/dev/null 2>&1
+        fi
+        takeover_end
+        log "reader screen restored"
         ;;
     probe)
         sleep "$FIRST_DRAW_DELAY"
@@ -1621,10 +1791,14 @@ case "$1" in
             if [ -n "$oldpid" ]; then
                 kill -- "-$oldpid" 2>/dev/null || kill "$oldpid" 2>/dev/null
             fi
-            pkill -f "calendar.sh __loop" >/dev/null 2>&1
+            command -v pkill >/dev/null 2>&1 && pkill -f "wall-display.sh __loop" >/dev/null 2>&1
             sleep 2
             heartbeat      # give the new loop a full window before judging it
-            setsid /bin/sh "$SCRIPT_PATH" __loop </dev/null >/dev/null 2>&1 &
+            if command -v setsid >/dev/null 2>&1; then
+                setsid /bin/sh "$SCRIPT_PATH" __loop </dev/null >/dev/null 2>&1 &
+            else
+                /bin/sh "$SCRIPT_PATH" __loop </dev/null >/dev/null 2>&1 &
+            fi
             wdlog "relaunched loop"
         done
         ;;
@@ -1666,7 +1840,7 @@ case "$1" in
         if [ -f "$PIDFILE" ]; then
             oldpid=$(cat "$PIDFILE" 2>/dev/null)
             if [ -n "$oldpid" ] && [ -d "/proc/$oldpid" ] && \
-               grep -q "calendar.sh" "/proc/$oldpid/cmdline" 2>/dev/null; then
+               grep -q "wall-display.sh" "/proc/$oldpid/cmdline" 2>/dev/null; then
                 log "loop already running (pid $oldpid)"
                 exit 0
             fi
@@ -1675,7 +1849,7 @@ case "$1" in
         fi
         # Detach the loop from KUAL's session entirely FIRST, and let the detached
         # child do the takeover. Order matters: see the note in __loop above.
-        # SCRIPT_PATH must be absolute. $0 is relative ("./bin/calendar.sh") when
+        # SCRIPT_PATH must be absolute. $0 is relative ("./bin/wall-display.sh") when
         # KUAL invokes us, and the detached child cannot rely on inheriting a
         # working directory that survives its parent, so a relative path here is a
         # second way to launch nothing at all.
@@ -1710,7 +1884,7 @@ case "$1" in
         # write one yet. Any previous watchdog is killed: two of them would fight
         # over restarts.
         heartbeat
-        pkill -f "calendar.sh __watchdog" >/dev/null 2>&1
+        command -v pkill >/dev/null 2>&1 && pkill -f "wall-display.sh __watchdog" >/dev/null 2>&1
         # Mirrors the PIDFILE handling above. Without this, a WDPIDFILE left over
         # from BEFORE a reboot already exists on disk, so the readiness-wait loop
         # below (which only checks "does the file exist") passes immediately and
@@ -1753,7 +1927,7 @@ case "$1" in
             fi
             mv "$WDPIDFILE" "$WDPIDFILE.last" 2>/dev/null
         fi
-        pkill -f "calendar.sh __watchdog" >/dev/null 2>&1
+        command -v pkill >/dev/null 2>&1 && pkill -f "wall-display.sh __watchdog" >/dev/null 2>&1
 
         if [ -f "$PIDFILE" ]; then
             stoppid=$(cat "$PIDFILE" 2>/dev/null)
@@ -1766,14 +1940,16 @@ case "$1" in
             mv "$PIDFILE" "$PIDFILE.last" 2>/dev/null
         fi
         # Belt and braces: current loops match __loop; pre-2026-08-03 ones match start.
-        pkill -f "calendar.sh __loop" >/dev/null 2>&1
-        pkill -f "calendar.sh start" >/dev/null 2>&1
+        if command -v pkill >/dev/null 2>&1; then
+            pkill -f "wall-display.sh __loop" >/dev/null 2>&1
+            pkill -f "wall-display.sh start" >/dev/null 2>&1
+        fi
         disarm_alarm    # the safety alarm must not wake a device we just stopped
-        takeover_end
-        log "stopped"
+        restore_reader_screen
+        log "stopped; reader screen restore scheduled"
         ;;
     *)
-        echo "usage: calendar.sh once|suspendtest [seconds]|start|stop|probe|ruler"
+        echo "usage: wall-display.sh once|suspendtest [seconds]|restore|start|stop|probe"
         exit 1
         ;;
 esac

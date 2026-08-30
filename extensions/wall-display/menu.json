@@ -1,13 +1,13 @@
 {
  "items": [
   {
-   "name": "TRMNL Calendar",
+   "name": "Kindle Wall Display",
    "priority": 1,
    "items": [
     {
-     "name": "Test once (keeps Kindle normal)",
+     "name": "Test once (keeps reader normal)",
      "action": "/bin/sh",
-     "params": "bin/calendar.sh once",
+     "params": "bin/wall-display.sh once",
      "priority": 1,
      "exitmenu": true,
      "refresh": false,
@@ -16,26 +16,35 @@
     {
      "name": "Suspend test (2 min, then wakes)",
      "action": "/bin/sh",
-     "params": "bin/calendar.sh suspendtest",
+     "params": "bin/wall-display.sh suspendtest",
      "priority": 2,
      "exitmenu": true,
      "refresh": false,
      "status": false
     },
     {
-     "name": "Suspend test WITH takeover (diagnostic)",
-     "action": "./bin/calendar.sh",
-     "params": "suspendtest-takeover",
+     "name": "Suspend test with takeover",
+     "action": "/bin/sh",
+     "params": "bin/wall-display.sh suspendtest-takeover",
      "priority": 3,
      "exitmenu": true,
      "refresh": false,
      "status": false
     },
     {
-     "name": "Start calendar display",
+     "name": "Restore reader screen",
      "action": "/bin/sh",
-     "params": "bin/calendar.sh start",
+     "params": "bin/wall-display.sh restore",
      "priority": 4,
+     "exitmenu": true,
+     "refresh": false,
+     "status": false
+    },
+    {
+     "name": "Start wall display",
+     "action": "/bin/sh",
+     "params": "bin/wall-display.sh start",
+     "priority": 5,
      "exitmenu": true,
      "refresh": false,
      "status": false
@@ -43,25 +52,16 @@
     {
      "name": "Stop and restore Kindle",
      "action": "/bin/sh",
-     "params": "bin/calendar.sh stop",
-     "priority": 5,
-     "exitmenu": true,
-     "refresh": false,
-     "status": false
-    },
-    {
-     "name": "Diagnose probes",
-     "action": "/bin/sh",
-     "params": "bin/calendar.sh probe",
+     "params": "bin/wall-display.sh stop",
      "priority": 6,
      "exitmenu": true,
      "refresh": false,
      "status": false
     },
     {
-     "name": "Show type ruler",
+     "name": "Diagnose",
      "action": "/bin/sh",
-     "params": "bin/calendar.sh ruler",
+     "params": "bin/wall-display.sh probe",
      "priority": 7,
      "exitmenu": true,
      "refresh": false,

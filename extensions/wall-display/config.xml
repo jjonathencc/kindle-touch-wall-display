@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <extension>
 	<information>
-		<name>TRMNL Calendar</name>
-		<version>1.0</version>
-		<author>trmnl-server</author>
-		<id>trmnlcal</id>
+		<name>Kindle Wall Display</name>
+		<version>2.0</version>
+		<author>Kindle Wall Display contributors</author>
+		<id>wall-display</id>
 	</information>
 	<menus>
 		<menu type="json" dynamic="false">menu.json</menu>
