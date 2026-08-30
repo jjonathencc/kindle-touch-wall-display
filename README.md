@@ -16,7 +16,7 @@ KDK 2.0.
 
 ## Install
 
-The ZIP has this layout:
+The files needed on the Kindle are:
 
 ```text
 extensions/
@@ -26,7 +26,7 @@ extensions/
     └── menu.json
 ```
 
-1. Extract the release ZIP.
+1. On GitHub, select `Code > Download ZIP`, then extract it.
 2. Open `extensions/wall-display/bin/wall-display.sh` and replace
    `CHANGE_ME_SERVER_HOST:8484` with the LAN address and port of your server.
 3. Connect the Kindle by USB. Copy the `wall-display` folder from the ZIP's
